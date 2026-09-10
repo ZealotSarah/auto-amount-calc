@@ -139,11 +139,11 @@ def determine_source_sheet(workbook) -> tuple[Any, int, dict[str, int]]:
     return best[2], best[3], best[4]
 
 
-def insurance_bucket(insurance: str) -> int | None:
-    text = insurance.replace(" ", "")
-    if "职工" in text:
+def insurance_bucket(insurance: Any) -> int | None:
+    text = text_value(insurance)
+    if text in {"310", "职工", "城镇职工", "职工基本医疗保险", "城镇职工基本医疗保险"}:
         return 0
-    if "居民" in text:
+    if text in {"390", "城乡", "居民", "城乡居民", "城乡居民基本医疗保险"}:
         return 1
     return None
 
@@ -173,7 +173,7 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
     columns = {
         "code": find_column(headers, ("定点编码", "医疗机构编码")),
         "name": find_column(headers, ("定点名称", "医疗机构名称")),
-        "insurance": find_column(headers, ("险种类型", "险种类别")),
+        "insurance": find_column(headers, ("险种类型", "险种类别", "INSUTYPE", "insutype")),
         "medical_total": find_column(headers, ("医疗费总额", "医疗总额")),
         "fund_total": find_column(headers, ("基金支付总额",)),
         "scope_amount": find_column(headers, ("符合范围金额",)),
@@ -200,7 +200,6 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
     groups: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
     warnings: list[str] = []
     processed = successful = errors = excluded = 0
-    total_fund = Decimal("0")
     for source_row, row in enumerate(source.iter_rows(min_row=header_row + 1, values_only=True), header_row + 1):
         if not any(cell is not None and str(cell).strip() for cell in row):
             continue
@@ -220,21 +219,12 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
             if medical_total < 0 or fund_total < 0 or scope_amount < 0:
                 raise CalculationError("医疗费总额、基金支付总额和符合范围金额不能为负数")
             visit_type = resolved_visit_type(get("visit_type"), options.visit_type, get("visit_name"))
-            key = (code, insurance, visit_type)
-            group = groups.setdefault(key, {
-                "name": name, "medical_total": Decimal("0"), "fund_total": Decimal("0"),
-                "fund_amount": Decimal("0"), "types": {visit_type}, "rates": set(),
-            })
-            group["medical_total"] += medical_total
-            group["fund_total"] += fund_total
 
             if visit_type == "门诊":
                 if medical_total == 0:
                     raise CalculationError("门诊医疗费总额为 0，无法计算")
-                rate = fund_total / medical_total
-                amount = scope_amount * rate
+                base = scope_amount
             else:
-                rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
                 if options.rule_type == "通用":
                     base = scope_amount
                 elif columns["violation_amount"] is not None:
@@ -248,17 +238,34 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
                         raise CalculationError("串换扣减后的计算基数为负数")
                 if base < 0:
                     raise CalculationError("计算基数为负数")
-                amount = base * rate
 
-            amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            group["fund_amount"] += amount
-            group["rates"].add(rate)
+            key = (code, insurance, visit_type)
+            group = groups.setdefault(key, {
+                "name": name, "medical_total": Decimal("0"), "fund_total": Decimal("0"),
+                "calculation_base": Decimal("0"), "fund_amount": Decimal("0"),
+                "types": {visit_type}, "rates": set(),
+            })
+            group["medical_total"] += medical_total
+            group["fund_total"] += fund_total
+            group["calculation_base"] += base
             successful += 1
-            total_fund += amount
         except CalculationError as exc:
             errors += 1
             if len(warnings) < 30:
                 warnings.append(f"第 {source_row} 行：{exc}")
+
+    total_fund = Decimal("0")
+    for (_, insurance, visit_type), group in groups.items():
+        bucket = insurance_bucket(insurance)
+        assert bucket is not None
+        if visit_type == "门诊":
+            rate = group["fund_total"] / group["medical_total"]
+        else:
+            rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
+        amount = group["calculation_base"] * rate
+        group["fund_amount"] = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        group["rates"].add(rate)
+        total_fund += group["fund_amount"]
 
     write_output_sheet(output, path, source.title, options, groups, processed, successful, errors, total_fund, warnings, excluded)
     try:
@@ -384,7 +391,7 @@ class CalculatorApp(tk.Tk):
         container = ttk.Frame(self, padding=16)
         container.pack(fill="both", expand=True)
         ttk.Label(container, text="基金金额自动测算工具", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(container, text="住院按 PDF 比例计算；门诊按（基金支付总额 ÷ 医疗费总额）× 符合范围金额计算。", foreground="#555555").pack(anchor="w", pady=(4, 12))
+        ttk.Label(container, text="先按结果维度汇总；住院使用 PDF 比例，门诊使用分组基金支付总额 ÷ 分组医疗费总额。", foreground="#555555").pack(anchor="w", pady=(4, 12))
         file_bar = ttk.Frame(container)
         file_bar.pack(fill="x")
         ttk.Button(file_bar, text="选择 Excel 文件", command=self.pick_files).pack(side="left")
