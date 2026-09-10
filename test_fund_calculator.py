@@ -22,12 +22,12 @@ class CalculatorTests(unittest.TestCase):
             with self.subTest(header=header), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "insurance.xlsx"
                 workbook = Workbook()
-                workbook.active.append(["定点编码", header, "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别"])
+                workbook.active.append(["定点编码", header, "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
                 for insurance in ("城乡", "职工", "390", 390, 390.0, "310", 310):
                     for visit in (11, 21):
-                        workbook.active.append(["H1", insurance, 100, 50, 20, visit])
+                        workbook.active.append(["H1", insurance, 100, 50, 20, visit, 1])
                 for insurance in ("其他", "非职工", "居民补充保险"):
-                    workbook.active.append(["H1", insurance, 100, 50, 20, 21])
+                    workbook.active.append(["H1", insurance, 100, 50, 20, 21, 1])
                 workbook.save(path)
                 workbook.close()
                 result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
@@ -40,11 +40,11 @@ class CalculatorTests(unittest.TestCase):
             path = Path(directory) / "grouped.xlsx"
             workbook = Workbook()
             source = workbook.active
-            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别"])
-            source.append(["H1", "城乡", 100, 0, 10, 11])
-            source.append(["H1", "城乡", 100, 100, 90, 11])
-            source.append(["H1", "城乡", 100, 50, 0.01, 21])
-            source.append(["H1", "城乡", 100, 50, 0.01, 21])
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", 100, 0, 10, 11, 3])
+            source.append(["H1", "城乡", 100, 100, 90, 11, 4])
+            source.append(["H1", "城乡", 100, 50, 0.01, 21, 5])
+            source.append(["H1", "城乡", 100, 50, 0.01, 21, 6])
             workbook.save(path)
             workbook.close()
 
@@ -55,9 +55,34 @@ class CalculatorTests(unittest.TestCase):
             self.assertEqual(result.total_fund, Decimal("50.01"))
             saved = load_workbook(path, data_only=True)
             output = saved["基金测算"]
-            self.assertEqual(output["F8"].value, 50)
-            self.assertEqual(output["G8"].value, 0.5)
-            self.assertEqual(output["F9"].value, 0.01)
+            self.assertEqual(output["F8"].value, 7)
+            self.assertEqual(output["G8"].value, 50)
+            self.assertEqual(output["H8"].value, 0.5)
+            self.assertEqual(output["F9"].value, 11)
+            self.assertEqual(output["G9"].value, 0.01)
+            self.assertEqual(next(iter(output.tables.values())).ref, "A7:H9")
+            saved.close()
+
+    def test_substitution_sums_quantity_after_deduction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "substitution.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量", "违规金额"])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 5, 10])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 4, 20])
+            workbook.save(path)
+            workbook.close()
+
+            with self.assertRaisesRegex(CalculationError, "扣减数量"):
+                run_file(path, RunOptions("串换", "自动识别", "廊坊市", "三级", None, None, True))
+            result = run_file(path, RunOptions("串换", "自动识别", "廊坊市", "三级", None, Decimal("2"), True))
+
+            self.assertEqual(result.total_fund, Decimal("17.05"))
+            saved = load_workbook(path, data_only=True)
+            output = saved["基金测算"]
+            self.assertEqual(output["F8"].value, 5)
+            self.assertEqual(output["G8"].value, 17.05)
             saved.close()
 
     def test_code_priority_and_name_fallback(self):
@@ -77,14 +102,14 @@ class CalculatorTests(unittest.TestCase):
             workbook = Workbook()
             source = workbook.active
             source.title = "明细"
-            source.append(["定点编码", "定点名称", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额1", "医疗类别", "医疗类别名称"])
-            source.append(["H1", "医院", "职工", 100, 50, 20, 11, "普通住院"])
-            source.append(["H1", "医院", "城乡居民基本医疗保险", 200, 100, 30, 21, "普通门诊"])
-            source.append(["H1", "医院", "其他", None, None, None, 11, "普通门诊"])
-            source.append(["H1", "医院", "其他", 999, 999, 999, 21, "普通住院"])
-            source.append(["H1", "医院", None, 999, 999, 999, 11, "普通门诊"])
-            source.append([None] * 8)
-            source.append(["H1", "医院", "职工", 100, 50, 20, 99, "未知"])
+            source.append(["定点编码", "定点名称", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额1", "医疗类别", "医疗类别名称", "数量"])
+            source.append(["H1", "医院", "职工", 100, 50, 20, 11, "普通住院", 2])
+            source.append(["H1", "医院", "城乡居民基本医疗保险", 200, 100, 30, 21, "普通门诊", 3])
+            source.append(["H1", "医院", "其他", None, None, None, 11, "普通门诊", None])
+            source.append(["H1", "医院", "其他", 999, 999, 999, 21, "普通住院", 9])
+            source.append(["H1", "医院", None, 999, 999, 999, 11, "普通门诊", 9])
+            source.append([None] * 9)
+            source.append(["H1", "医院", "职工", 100, 50, 20, 99, "未知", 1])
             original = list(source.values)
             workbook.save(path)
             workbook.close()
@@ -97,16 +122,18 @@ class CalculatorTests(unittest.TestCase):
             output = saved["基金测算"]
             self.assertEqual(output["F5"].value, 3)
             self.assertEqual(sum(output.cell(row, 5).value for row in (8, 9)), 300)
-            self.assertEqual(output["G8"].value, 0.5)
-            self.assertEqual(output["G9"].value, 0.5684)
+            self.assertEqual(output["F8"].value, 2)
+            self.assertEqual(output["H8"].value, 0.5)
+            self.assertEqual(output["F9"].value, 3)
+            self.assertEqual(output["H9"].value, 0.5684)
             saved.close()
 
     def test_name_only_column(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "name.xlsx"
             workbook = Workbook()
-            workbook.active.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别名称"])
-            workbook.active.append(["H1", "居民", 100, 50, 20, "普通门诊"])
+            workbook.active.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别名称", "数量"])
+            workbook.active.append(["H1", "居民", 100, 50, 20, "普通门诊", 1])
             workbook.save(path)
             workbook.close()
             result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))

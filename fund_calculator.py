@@ -1,6 +1,6 @@
 """基金金额自动测算工具。
 
-结果 Sheet 仅输出用户约定的七列汇总字段。住院比例内置自
+结果 Sheet 仅输出用户约定的八列汇总字段。住院比例内置自
 《24年25年目录内（费用）住院基金支付比例》；门诊不使用该比例表。
 """
 
@@ -183,14 +183,16 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
         "price": find_column(headers, ("单价",)),
         "quantity": find_column(headers, ("数量",)),
     }
-    missing = [name for name in ("code", "insurance", "medical_total", "fund_total", "scope_amount") if columns[name] is None]
+    missing = [name for name in ("code", "insurance", "medical_total", "fund_total", "scope_amount", "quantity") if columns[name] is None]
     if missing:
-        labels = {"code": "定点编码", "insurance": "险种类型", "medical_total": "医疗费总额", "fund_total": "基金支付总额", "scope_amount": "符合范围金额"}
+        labels = {"code": "定点编码", "insurance": "险种类型", "medical_total": "医疗费总额", "fund_total": "基金支付总额", "scope_amount": "符合范围金额", "quantity": "数量"}
         raise CalculationError("缺少必填列：" + "、".join(labels[name] for name in missing))
     if options.visit_type == "自动识别" and columns["visit_type"] is None:
         raise CalculationError("选择“自动识别”时，原表必须有“医疗类别”列。")
-    if options.rule_type == "串换" and columns["violation_amount"] is None and (options.deduction_price is None or options.deduction_quantity is None):
-        raise CalculationError("串换规则且无“违规金额”列时，必须填写扣减单价和扣减数量。")
+    if options.rule_type == "串换" and options.deduction_quantity is None:
+        raise CalculationError("串换规则必须填写扣减数量。")
+    if options.rule_type == "串换" and columns["violation_amount"] is None and options.deduction_price is None:
+        raise CalculationError("串换规则且无“违规金额”列时，必须填写扣减单价。")
 
     output_name = create_output_sheet_name(workbook, options.overwrite_result)
     if output_name == OUTPUT_SHEET and OUTPUT_SHEET in workbook.sheetnames:
@@ -216,9 +218,16 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
             medical_total = as_decimal(get("medical_total"), "医疗费总额")
             fund_total = as_decimal(get("fund_total"), "基金支付总额")
             scope_amount = as_decimal(get("scope_amount"), "符合范围金额")
-            if medical_total < 0 or fund_total < 0 or scope_amount < 0:
-                raise CalculationError("医疗费总额、基金支付总额和符合范围金额不能为负数")
+            quantity = as_decimal(get("quantity"), "数量")
+            if medical_total < 0 or fund_total < 0 or scope_amount < 0 or quantity < 0:
+                raise CalculationError("医疗费总额、基金支付总额、符合范围金额和数量不能为负数")
             visit_type = resolved_visit_type(get("visit_type"), options.visit_type, get("visit_name"))
+            result_quantity = quantity
+            if options.rule_type == "串换":
+                assert options.deduction_quantity is not None
+                result_quantity -= options.deduction_quantity
+                if result_quantity < 0:
+                    raise CalculationError("串换扣减后的数量为负数")
 
             if visit_type == "门诊":
                 if medical_total == 0:
@@ -231,23 +240,25 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
                     base = as_decimal(get("violation_amount"), "违规金额")
                 else:
                     price = as_decimal(get("price"), "原单价")
-                    quantity = as_decimal(get("quantity"), "原数量")
-                    assert options.deduction_price is not None and options.deduction_quantity is not None
-                    base = (price - options.deduction_price) * (quantity - options.deduction_quantity)
-                    if base < 0:
-                        raise CalculationError("串换扣减后的计算基数为负数")
+                    assert options.deduction_price is not None
+                    result_price = price - options.deduction_price
+                    if result_price < 0:
+                        raise CalculationError("串换扣减后的单价为负数")
+                    base = result_price * result_quantity
                 if base < 0:
                     raise CalculationError("计算基数为负数")
 
             key = (code, insurance, visit_type)
             group = groups.setdefault(key, {
                 "name": name, "medical_total": Decimal("0"), "fund_total": Decimal("0"),
-                "calculation_base": Decimal("0"), "fund_amount": Decimal("0"),
+                "calculation_base": Decimal("0"), "quantity_total": Decimal("0"),
+                "fund_amount": Decimal("0"),
                 "types": {visit_type}, "rates": set(),
             })
             group["medical_total"] += medical_total
             group["fund_total"] += fund_total
             group["calculation_base"] += base
+            group["quantity_total"] += result_quantity
             successful += 1
         except CalculationError as exc:
             errors += 1
@@ -285,7 +296,7 @@ def create_output_sheet_name(workbook, overwrite: bool) -> str:
 def write_output_sheet(output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict, processed: int, successful: int, errors: int, total_fund: Decimal, warnings: list[str], excluded: int) -> None:
     navy = PatternFill("solid", fgColor="1F4E78")
     blue = PatternFill("solid", fgColor="D9EAF7")
-    output.merge_cells("A1:G1")
+    output.merge_cells("A1:H1")
     output["A1"] = "基金金额测算结果"
     output["A1"].font = Font(size=14, bold=True, color="FFFFFF")
     output["A1"].fill = navy
@@ -307,7 +318,7 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
     output["D5"].number_format = "#,##0.00"
 
     header_row = 7
-    headers = ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "基金金额", "报销比例"]
+    headers = ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "基金金额", "报销比例"]
     for column, header in enumerate(headers, 1):
         cell = output.cell(header_row, column, header)
         cell.font = Font(bold=True, color="FFFFFF")
@@ -320,15 +331,17 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         output.cell(row_number, 3, insurance)
         output.cell(row_number, 4, visit_type)
         output.cell(row_number, 5, float(group["medical_total"]))
-        output.cell(row_number, 6, float(group["fund_amount"]))
-        output.cell(row_number, 7, float(rate) if isinstance(rate, Decimal) else rate)
+        output.cell(row_number, 6, float(group["quantity_total"]))
+        output.cell(row_number, 7, float(group["fund_amount"]))
+        output.cell(row_number, 8, float(rate) if isinstance(rate, Decimal) else rate)
         output.cell(row_number, 5).number_format = "#,##0.00"
-        output.cell(row_number, 6).number_format = "#,##0.00"
+        output.cell(row_number, 6).number_format = "#,##0.####"
+        output.cell(row_number, 7).number_format = "#,##0.00"
         if isinstance(rate, Decimal):
-            output.cell(row_number, 7).number_format = "0.00%"
+            output.cell(row_number, 8).number_format = "0.00%"
     if groups:
         last_row = header_row + len(groups)
-        table = Table(displayName=unique_table_name(output), ref=f"A{header_row}:G{last_row}")
+        table = Table(displayName=unique_table_name(output), ref=f"A{header_row}:H{last_row}")
         table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
         output.add_table(table)
     else:
@@ -340,14 +353,15 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
     output.column_dimensions["D"].width = 14
     output.column_dimensions["E"].width = 16
     output.column_dimensions["F"].width = 16
-    output.column_dimensions["G"].width = 14
+    output.column_dimensions["G"].width = 16
+    output.column_dimensions["H"].width = 14
     output.freeze_panes = "A8"
     if warnings:
         output["A" + str(header_row + len(groups) + 3)] = "异常示例（最多显示 30 条）"
         output["A" + str(header_row + len(groups) + 3)].font = Font(bold=True, color="C00000")
         for offset, warning in enumerate(warnings, 4):
             output["A" + str(header_row + len(groups) + offset)] = warning
-            output.merge_cells(start_row=header_row + len(groups) + offset, start_column=1, end_row=header_row + len(groups) + offset, end_column=7)
+            output.merge_cells(start_row=header_row + len(groups) + offset, start_column=1, end_row=header_row + len(groups) + offset, end_column=8)
 
 
 def group_rate(group: dict[str, Any]) -> Decimal | str:
@@ -407,7 +421,7 @@ class CalculatorApp(tk.Tk):
         self.add_combo(params, "医疗机构级别", self.institution_level, ["三级", "二级", "一级"], 1, 1)
         ttk.Label(params, text="扣减单价（仅串换无违规金额列时）").grid(row=2, column=0, sticky="w", pady=(10, 0))
         ttk.Entry(params, textvariable=self.deduction_price, width=26).grid(row=2, column=1, sticky="ew", pady=(10, 0))
-        ttk.Label(params, text="扣减数量（仅串换无违规金额列时）").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Label(params, text="扣减数量（串换必填）").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(params, textvariable=self.deduction_quantity, width=26).grid(row=3, column=1, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(params, text="覆盖已有“基金测算”Sheet（否则自动新建带时间的 Sheet）", variable=self.overwrite_result).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
         params.columnconfigure(1, weight=1)
