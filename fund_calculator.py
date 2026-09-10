@@ -73,6 +73,7 @@ class FileResult:
     processed: int
     successful: int
     errors: int
+    excluded: int
     total_fund: Decimal
     warnings: list[str]
 
@@ -142,19 +143,23 @@ def insurance_bucket(insurance: str) -> int | None:
     text = insurance.replace(" ", "")
     if "职工" in text:
         return 0
-    if "居民" in text or "城乡" in text:
+    if "居民" in text:
         return 1
     return None
 
 
-def resolved_visit_type(raw: Any, selected: str) -> str:
+def resolved_visit_type(raw: Any, selected: str, name: Any = None) -> str:
     if selected != "自动识别":
         return selected
     value = text_value(raw)
-    if "住院" in value:
-        return "住院"
-    if "门诊" in value:
-        return "门诊"
+    code_types = {"11": "门诊", "14": "门诊", "51": "门诊", "21": "住院", "22": "住院", "52": "住院"}
+    if value in code_types:
+        return code_types[value]
+    for label in (value, text_value(name)):
+        if "住院" in label:
+            return "住院"
+        if "门诊" in label:
+            return "门诊"
     raise CalculationError(f"无法从医疗类别识别住院或门诊：{value or '空值'}")
 
 
@@ -173,6 +178,7 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
         "fund_total": find_column(headers, ("基金支付总额",)),
         "scope_amount": find_column(headers, ("符合范围金额",)),
         "visit_type": find_column(headers, ("医疗类别",)),
+        "visit_name": find_column(headers, ("医疗类别名称",)),
         "violation_amount": find_column(headers, ("违规金额",)),
         "price": find_column(headers, ("单价",)),
         "quantity": find_column(headers, ("数量",)),
@@ -193,9 +199,9 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
 
     groups: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
     warnings: list[str] = []
-    processed = successful = errors = 0
+    processed = successful = errors = excluded = 0
     total_fund = Decimal("0")
-    for row in source.iter_rows(min_row=header_row + 1, values_only=True):
+    for source_row, row in enumerate(source.iter_rows(min_row=header_row + 1, values_only=True), header_row + 1):
         if not any(cell is not None and str(cell).strip() for cell in row):
             continue
         processed += 1
@@ -203,13 +209,17 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
         code = text_value(get("code")) or "未填写编码"
         name = text_value(get("name")) or "未填写名称"
         insurance = text_value(get("insurance")) or "未填写险种"
+        bucket = insurance_bucket(insurance)
+        if bucket is None:
+            excluded += 1
+            continue
         try:
             medical_total = as_decimal(get("medical_total"), "医疗费总额")
             fund_total = as_decimal(get("fund_total"), "基金支付总额")
             scope_amount = as_decimal(get("scope_amount"), "符合范围金额")
             if medical_total < 0 or fund_total < 0 or scope_amount < 0:
                 raise CalculationError("医疗费总额、基金支付总额和符合范围金额不能为负数")
-            visit_type = resolved_visit_type(get("visit_type"), options.visit_type)
+            visit_type = resolved_visit_type(get("visit_type"), options.visit_type, get("visit_name"))
             key = (code, insurance, visit_type)
             group = groups.setdefault(key, {
                 "name": name, "medical_total": Decimal("0"), "fund_total": Decimal("0"),
@@ -224,9 +234,6 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
                 rate = fund_total / medical_total
                 amount = scope_amount * rate
             else:
-                bucket = insurance_bucket(insurance)
-                if bucket is None:
-                    raise CalculationError(f"住院险种无法识别为职工或居民：{insurance}")
                 rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
                 if options.rule_type == "通用":
                     base = scope_amount
@@ -251,14 +258,14 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
         except CalculationError as exc:
             errors += 1
             if len(warnings) < 30:
-                warnings.append(f"第 {header_row + processed} 行：{exc}")
+                warnings.append(f"第 {source_row} 行：{exc}")
 
-    write_output_sheet(output, path, source.title, options, groups, processed, successful, errors, total_fund, warnings)
+    write_output_sheet(output, path, source.title, options, groups, processed, successful, errors, total_fund, warnings, excluded)
     try:
         workbook.save(path)
     except PermissionError as exc:
         raise CalculationError(f"无法保存文件。请关闭 Excel 中已打开的工作簿后重试：{path.name}") from exc
-    return FileResult(path, output_name, processed, successful, errors, total_fund, warnings)
+    return FileResult(path, output_name, processed, successful, errors, excluded, total_fund, warnings)
 
 
 def create_output_sheet_name(workbook, overwrite: bool) -> str:
@@ -268,7 +275,7 @@ def create_output_sheet_name(workbook, overwrite: bool) -> str:
     return f"{OUTPUT_SHEET}_{suffix}"
 
 
-def write_output_sheet(output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict, processed: int, successful: int, errors: int, total_fund: Decimal, warnings: list[str]) -> None:
+def write_output_sheet(output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict, processed: int, successful: int, errors: int, total_fund: Decimal, warnings: list[str], excluded: int) -> None:
     navy = PatternFill("solid", fgColor="1F4E78")
     blue = PatternFill("solid", fgColor="D9EAF7")
     output.merge_cells("A1:G1")
@@ -282,6 +289,7 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         ("医疗机构级别", options.institution_level), ("比例版本", RATE_VERSION),
         ("处理记录数", processed), ("计算成功数", successful), ("异常数", errors),
         ("基金金额合计", total_fund),
+        ("排除险种记录数", excluded),
     ]
     for index, (label, value) in enumerate(metadata):
         row = 2 + index // 3
@@ -445,7 +453,7 @@ class CalculatorApp(tk.Tk):
             try:
                 result = run_file(path, options)
                 results.append(result)
-                self.after(0, self.write_log, f"完成：{path.name} → {result.sheet_name}；成功 {result.successful}，异常 {result.errors}，基金金额 {result.total_fund:,.2f}\n")
+                self.after(0, self.write_log, f"完成：{path.name} → {result.sheet_name}；成功 {result.successful}，排除 {result.excluded}，异常 {result.errors}，基金金额 {result.total_fund:,.2f}\n")
             except Exception as exc:  # Keep batch processing independent per file.
                 failures.append(f"{path.name}：{exc}")
                 self.after(0, self.write_log, f"失败：{path.name} → {exc}\n")
