@@ -74,6 +74,31 @@ class CalculatorTests(unittest.TestCase):
             self.assertEqual(next(iter(output.tables.values())).ref, "A7:H9")
             saved.close()
 
+    def test_fixed_rate_uses_same_rate_for_inpatient_and_outpatient(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "fixed-rate.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", 0, 0, 20, 11, 2])
+            source.append(["H1", "城乡", 100, 90, 20, 21, 3])
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions("固定比例", "自动识别", "廊坊市", "三级", None, None, True))
+
+            self.assertEqual(result.total_fund, Decimal("22.74"))
+            saved = load_workbook(path, read_only=True, data_only=True)
+            try:
+                output = saved["基金测算"]
+                rows = {output.cell(row, 4).value: row for row in (8, 9)}
+                self.assertEqual(output.cell(rows["门诊"], 7).value, 11.37)
+                self.assertEqual(output.cell(rows["门诊"], 8).value, 0.5684)
+                self.assertEqual(output.cell(rows["住院"], 7).value, 11.37)
+                self.assertEqual(output.cell(rows["住院"], 8).value, 0.5684)
+            finally:
+                saved.close()
+
     def test_substitution_sums_quantity_after_deduction(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "substitution.xlsx"

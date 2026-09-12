@@ -1,7 +1,7 @@
 """基金金额自动测算工具。
 
-结果 Sheet 仅输出用户约定的八列汇总字段。住院比例内置自
-《24年25年目录内（费用）住院基金支付比例》；门诊不使用该比例表。
+结果 Sheet 仅输出用户约定的八列汇总字段。固定比例规则下住院和门诊
+均使用内置的《24年25年目录内（费用）住院基金支付比例》。
 """
 
 from __future__ import annotations
@@ -238,12 +238,12 @@ def resolved_visit_type(raw: Any, selected: str, name: Any = None) -> str:
 
 
 def validate_options(options: RunOptions) -> None:
-    if options.rule_type not in {"通用", "串换"}:
+    if options.rule_type not in {"通用", "串换", "固定比例"}:
         raise CalculationError("请选择规则大类。")
     if options.visit_type not in {"自动识别", "住院", "门诊"}:
         raise CalculationError("请选择业务类型。")
     if options.pooling_area not in FUND_RATES:
-        raise CalculationError("请选择参保地（住院报销比例）。")
+        raise CalculationError("请选择参保地（比例表匹配）。")
     if options.institution_level not in {"三级", "二级", "一级"}:
         raise CalculationError("请选择医疗机构级别。")
     for value, label in ((options.deduction_price, "扣减单价"), (options.deduction_quantity, "扣减数量")):
@@ -313,7 +313,9 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
                 if result_quantity < 0:
                     raise CalculationError("串换扣减后的数量为负数")
 
-            if visit_type == "门诊":
+            if options.rule_type == "固定比例":
+                base = scope_amount
+            elif visit_type == "门诊":
                 if medical_total == 0:
                     raise CalculationError("门诊医疗费总额为 0，无法计算")
                 base = scope_amount
@@ -353,7 +355,9 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
     for (_, insurance, visit_type), group in groups.items():
         bucket = insurance_bucket(insurance)
         assert bucket is not None
-        if visit_type == "门诊":
+        if options.rule_type == "固定比例":
+            rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
+        elif visit_type == "门诊":
             rate = group["fund_total"] / group["medical_total"]
         else:
             rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
@@ -450,7 +454,7 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
     output["A1"].alignment = Alignment(horizontal="center")
     metadata = [
         ("源文件", path.name), ("源数据 Sheet", source_name), ("规则大类", options.rule_type),
-        ("业务类型", options.visit_type), ("参保地（住院比例）", options.pooling_area),
+        ("业务类型", options.visit_type), ("参保地（比例表匹配）", options.pooling_area),
         ("医疗机构级别", options.institution_level), ("比例版本", RATE_VERSION),
         ("处理记录数", processed), ("计算成功数", successful), ("异常数", errors),
         ("基金金额合计", total_fund),
@@ -513,7 +517,7 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
 
 def group_rate(group: dict[str, Any]) -> Decimal | str:
     types = group["types"]
-    if types == {"住院"} and len(group["rates"]) == 1:
+    if len(group["rates"]) == 1:
         return next(iter(group["rates"]))
     if types == {"门诊"}:
         return Decimal("0") if group["medical_total"] == 0 else group["fund_total"] / group["medical_total"]
@@ -555,7 +559,7 @@ class CalculatorApp(tk.Tk):
         container = ttk.Frame(self, padding=16)
         container.pack(fill="both", expand=True)
         ttk.Label(container, text="基金金额自动测算工具", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(container, text="先按结果维度汇总；住院使用 PDF 比例，门诊使用分组基金支付总额 ÷ 分组医疗费总额。", foreground="#555555").pack(anchor="w", pady=(4, 12))
+        ttk.Label(container, text="先按结果维度汇总；固定比例下住院、门诊均使用比例表，其余规则门诊动态计算。", foreground="#555555").pack(anchor="w", pady=(4, 12))
         file_bar = ttk.Frame(container)
         file_bar.pack(fill="x")
         self.pick_button = ttk.Button(file_bar, text="选择 Excel 文件", command=self.pick_files)
@@ -567,9 +571,9 @@ class CalculatorApp(tk.Tk):
 
         params = ttk.LabelFrame(container, text="参数", padding=12)
         params.pack(fill="x", pady=12)
-        self.add_combo(params, "规则大类", self.rule_type, ["通用", "串换"], 0, 0)
+        self.add_combo(params, "规则大类", self.rule_type, ["通用", "串换", "固定比例"], 0, 0)
         self.add_combo(params, "业务类型", self.visit_type, ["自动识别", "住院", "门诊"], 0, 1)
-        self.add_combo(params, "参保地（住院报销比例）", self.pooling_area, list(FUND_RATES), 1, 0)
+        self.add_combo(params, "参保地（比例表匹配）", self.pooling_area, list(FUND_RATES), 1, 0)
         self.add_combo(params, "医疗机构级别", self.institution_level, ["三级", "二级", "一级"], 1, 1)
         ttk.Label(params, text="源数据 Sheet").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.source_sheet_combo = ttk.Combobox(params, textvariable=self.source_sheet, values=[AUTO_SOURCE_SHEET], width=26)
