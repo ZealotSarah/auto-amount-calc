@@ -27,7 +27,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 RATE_VERSION = "24-25 年住院基金支付比例"
-APP_VERSION = "0.8.0"
+APP_VERSION = "0.8.1"
 OUTPUT_SHEET = "基金测算"
 AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
 

@@ -1,3 +1,4 @@
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -7,6 +8,8 @@ from pathlib import Path
 from openpyxl import Workbook, load_workbook
 
 from fund_calculator import CalculationError, RunOptions, insurance_bucket, resolved_visit_type, run_file, validate_options
+
+FIXTURE_DIR = Path(__file__).with_name("test_fixtures")
 
 
 class CalculatorTests(unittest.TestCase):
@@ -114,7 +117,7 @@ class CalculatorTests(unittest.TestCase):
                 self.assertEqual(output.cell(rows["门诊"], 8).value, 0.5684)
                 self.assertEqual(output.cell(rows["住院"], 7).value, 11.37)
                 self.assertEqual(output.cell(rows["住院"], 8).value, 0.5684)
-                self.assertEqual(output["J3"].value, "0.8.0")
+                self.assertEqual(output["J3"].value, "0.8.1")
                 self.assertEqual(output["J6"].value, "普通汇总表（非 Excel 原生透视表）")
             finally:
                 saved.close()
@@ -341,6 +344,40 @@ class CalculatorTests(unittest.TestCase):
         for options, message in invalid_options:
             with self.subTest(message=message), self.assertRaisesRegex(CalculationError, message):
                 validate_options(options)
+
+    def test_sanitized_sample_02_regression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample_02_sanitized.xlsx"
+            shutil.copy2(FIXTURE_DIR / path.name, path)
+
+            result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True, "With"))
+
+            self.assertEqual((result.processed, result.successful, result.excluded, result.errors), (6, 5, 1, 0))
+            self.assertEqual(result.total_fund, Decimal("153.13"))
+            saved = load_workbook(path, read_only=True, data_only=True)
+            try:
+                output = saved["基金测算"]
+                self.assertEqual(output["D2"].value, "With")
+                self.assertEqual(sum(output.cell(row, 6).value for row in range(8, 12)), 12)
+            finally:
+                saved.close()
+
+    def test_sanitized_sample_03_regression(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "sample_03_sanitized.xlsx"
+            shutil.copy2(FIXTURE_DIR / path.name, path)
+
+            result = run_file(path, RunOptions("固定比例", "自动识别", "廊坊市", "三级", None, None, True, "With"))
+
+            self.assertEqual((result.processed, result.successful, result.excluded, result.errors), (4, 3, 1, 0))
+            self.assertEqual(result.total_fund, Decimal("102.04"))
+            saved = load_workbook(path, read_only=True, data_only=True)
+            try:
+                output = saved["基金测算"]
+                self.assertEqual({output.cell(row, 2).value for row in range(8, 11)}, {"脱敏医院乙"})
+                self.assertEqual({output.cell(row, 8).value for row in range(8, 10)}, {0.5684})
+            finally:
+                saved.close()
 
 
 if __name__ == "__main__":
