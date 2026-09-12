@@ -5,10 +5,21 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from fund_calculator import CalculationError, RunOptions, insurance_bucket, resolved_visit_type, run_file
+from fund_calculator import CalculationError, RunOptions, insurance_bucket, resolved_visit_type, run_file, validate_options
 
 
 class CalculatorTests(unittest.TestCase):
+    @staticmethod
+    def make_source(path: Path, sheet_names: tuple[str, ...] = ("业务明细",)) -> None:
+        workbook = Workbook()
+        workbook.remove(workbook.active)
+        for sheet_name in sheet_names:
+            source = workbook.create_sheet(sheet_name)
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 1])
+        workbook.save(path)
+        workbook.close()
+
     def test_insurance_exact_names_and_codes(self):
         for value in ("职工", "城镇职工基本医疗保险", "310", 310, 310.0):
             self.assertEqual(insurance_bucket(value), 0, value)
@@ -138,6 +149,72 @@ class CalculatorTests(unittest.TestCase):
             workbook.close()
             result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
             self.assertEqual((result.successful, result.errors, result.total_fund), (1, 0, Decimal("10.00")))
+
+    def test_safe_save_keeps_exact_precalculation_backup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "safe.xlsx"
+            self.make_source(path)
+            original_bytes = path.read_bytes()
+
+            result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+            self.assertIsNotNone(result.backup_path)
+            self.assertTrue(result.backup_path.exists())
+            self.assertEqual(result.backup_path.read_bytes(), original_bytes)
+            self.assertNotEqual(path.read_bytes(), original_bytes)
+            saved = load_workbook(path, read_only=True, data_only=True)
+            self.assertIn("基金测算", saved.sheetnames)
+            saved.close()
+
+    def test_multiple_source_sheets_require_explicit_selection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "multiple.xlsx"
+            self.make_source(path, ("明细一", "明细二"))
+            original_bytes = path.read_bytes()
+            options = RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True)
+
+            with self.assertRaisesRegex(CalculationError, "多个可用业务 Sheet"):
+                run_file(path, options)
+            self.assertEqual(path.read_bytes(), original_bytes)
+            self.assertFalse(list(path.parent.glob("*_测算前备份_*.xlsx")))
+
+            options.source_sheet = "明细二"
+            result = run_file(path, options)
+            self.assertEqual(result.total_fund, Decimal("11.37"))
+            saved = load_workbook(path, read_only=True, data_only=True)
+            try:
+                self.assertEqual(saved["基金测算"]["D2"].value, "明细二")
+            finally:
+                saved.close()
+
+    def test_ambiguous_candidate_columns_are_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ambiguous.xlsx"
+            workbook = Workbook()
+            workbook.active.append([
+                "定点编码", "险种类型", "医疗费总额", "基金支付总额",
+                "符合范围金额1", "符合范围金额2", "医疗类别", "数量",
+            ])
+            workbook.active.append(["H1", "城乡", 100, 50, 20, 30, 21, 1])
+            workbook.save(path)
+            workbook.close()
+
+            with self.assertRaisesRegex(CalculationError, "符合范围金额匹配到多个列"):
+                run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+    def test_required_choices_and_deductions_are_validated(self):
+        valid = RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True)
+        invalid_options = (
+            (RunOptions("通用", "自动识别", "", "三级", None, None, True), "参保地"),
+            (RunOptions("通用", "自动识别", "廊坊市", "", None, None, True), "医疗机构级别"),
+            (RunOptions("通用", "自动识别", "廊坊市", "三级", Decimal("-1"), None, True), "扣减单价"),
+            (RunOptions("串换", "自动识别", "廊坊市", "三级", None, Decimal("-1"), True), "扣减数量"),
+            (RunOptions("串换", "自动识别", "廊坊市", "三级", None, Decimal("NaN"), True), "扣减数量"),
+        )
+        validate_options(valid)
+        for options, message in invalid_options:
+            with self.subTest(message=message), self.assertRaisesRegex(CalculationError, message):
+                validate_options(options)
 
 
 if __name__ == "__main__":

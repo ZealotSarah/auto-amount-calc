@@ -11,6 +11,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import traceback
 from collections import OrderedDict
@@ -29,6 +30,29 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 RATE_VERSION = "24-25 年住院基金支付比例"
 OUTPUT_SHEET = "基金测算"
+AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
+
+COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "code": ("定点编码", "医疗机构编码"),
+    "name": ("定点名称", "医疗机构名称"),
+    "insurance": ("险种类型", "险种类别", "INSUTYPE", "insutype"),
+    "medical_total": ("医疗费总额", "医疗总额"),
+    "fund_total": ("基金支付总额",),
+    "scope_amount": ("符合范围金额",),
+    "visit_type": ("医疗类别",),
+    "visit_name": ("医疗类别名称",),
+    "violation_amount": ("违规金额",),
+    "price": ("单价",),
+    "quantity": ("数量",),
+}
+REQUIRED_COLUMNS = ("code", "insurance", "medical_total", "fund_total", "scope_amount", "quantity")
+COLUMN_LABELS = {
+    "code": "定点编码", "name": "定点名称", "insurance": "险种类型",
+    "medical_total": "医疗费总额", "fund_total": "基金支付总额",
+    "scope_amount": "符合范围金额", "visit_type": "医疗类别",
+    "visit_name": "医疗类别名称", "violation_amount": "违规金额",
+    "price": "单价", "quantity": "数量",
+}
 
 # 统筹区: {医疗机构级别: (职工, 居民, 合计)}。数值为小数比例。
 FUND_RATES: dict[str, dict[str, tuple[Decimal, Decimal, Decimal]]] = {
@@ -64,6 +88,7 @@ class RunOptions:
     deduction_price: Decimal | None
     deduction_quantity: Decimal | None
     overwrite_result: bool
+    source_sheet: str | None = None
 
 
 @dataclass
@@ -76,6 +101,7 @@ class FileResult:
     excluded: int
     total_fund: Decimal
     warnings: list[str]
+    backup_path: Path | None = None
 
 
 def clean_header(value: Any) -> str:
@@ -86,9 +112,12 @@ def as_decimal(value: Any, label: str) -> Decimal:
     if value is None or str(value).strip() == "":
         raise CalculationError(f"{label}为空")
     try:
-        return Decimal(str(value).replace(",", "").strip())
+        number = Decimal(str(value).replace(",", "").strip())
     except (InvalidOperation, ValueError) as exc:
         raise CalculationError(f"{label}不是数字：{value}") from exc
+    if not number.is_finite():
+        raise CalculationError(f"{label}不是有限数字：{value}")
+    return number
 
 
 def optional_decimal(value: str, label: str) -> Decimal | None:
@@ -105,38 +134,83 @@ def text_value(value: Any) -> str:
     return str(value).strip()
 
 
-def find_column(headers: dict[str, int], candidates: Iterable[str]) -> int | None:
+def collect_headers(cells: Iterable[Any]) -> dict[str, list[int]]:
+    headers: dict[str, list[int]] = {}
+    for cell in cells:
+        header = clean_header(cell.value)
+        if header:
+            headers.setdefault(header, []).append(cell.column)
+    return headers
+
+
+def find_column(headers: dict[str, list[int]], candidates: Iterable[str], label: str = "字段") -> int | None:
+    exact_matches: list[tuple[str, int]] = []
     for candidate in candidates:
         exact = clean_header(candidate)
-        if exact in headers:
-            return headers[exact]
-    for candidate in candidates:
-        prefix = clean_header(candidate)
-        matches = [index for header, index in headers.items() if header.startswith(prefix)]
-        if matches:
-            return min(matches)
-    return None
+        exact_matches.extend((exact, index) for index in headers.get(exact, []))
+    if exact_matches:
+        if len(exact_matches) > 1:
+            locations = "、".join(f"{name}（第 {index} 列）" for name, index in exact_matches)
+            raise CalculationError(f"{label}匹配到多个列：{locations}")
+        return exact_matches[0][1]
+
+    prefix_matches: list[tuple[str, int]] = []
+    prefixes = tuple(clean_header(candidate) for candidate in candidates)
+    for header, indexes in headers.items():
+        if any(header.startswith(prefix) for prefix in prefixes):
+            prefix_matches.extend((header, index) for index in indexes)
+    if len(prefix_matches) > 1:
+        locations = "、".join(f"{name}（第 {index} 列）" for name, index in prefix_matches)
+        raise CalculationError(f"{label}匹配到多个列：{locations}")
+    return prefix_matches[0][1] if prefix_matches else None
 
 
-def determine_source_sheet(workbook) -> tuple[Any, int, dict[str, int]]:
-    required = ("定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额")
-    best: tuple[int, int, Any, int, dict[str, int]] | None = None
-    for sheet in workbook.worksheets:
-        if sheet.title.startswith(OUTPUT_SHEET):
-            continue
+def resolve_columns(headers: dict[str, list[int]]) -> dict[str, int | None]:
+    return {
+        name: find_column(headers, candidates, COLUMN_LABELS[name])
+        for name, candidates in COLUMN_CANDIDATES.items()
+    }
+
+
+def determine_source_sheet(workbook, requested_sheet: str | None = None) -> tuple[Any, int, dict[str, list[int]]]:
+    if requested_sheet:
+        if requested_sheet not in workbook.sheetnames:
+            raise CalculationError(f"找不到指定的源数据 Sheet：{requested_sheet}")
+        sheets = [workbook[requested_sheet]]
+    else:
+        sheets = [sheet for sheet in workbook.worksheets if not sheet.title.startswith(OUTPUT_SHEET)]
+
+    valid: list[tuple[Any, int, dict[str, list[int]]]] = []
+    diagnostics: list[str] = []
+    for sheet in sheets:
+        best: tuple[int, int, dict[str, list[int]], list[str]] | None = None
         for header_row in range(1, min(10, sheet.max_row) + 1):
-            headers = {
-                clean_header(cell.value): cell.column
-                for cell in sheet[header_row]
-                if clean_header(cell.value)
-            }
-            score = sum(find_column(headers, (field,)) is not None for field in required)
-            candidate = (score, sheet.max_row, sheet, header_row, headers)
+            headers = collect_headers(sheet[header_row])
+            try:
+                columns = resolve_columns(headers)
+            except CalculationError as exc:
+                diagnostics.append(f"{sheet.title} 第 {header_row} 行：{exc}")
+                continue
+            missing = [COLUMN_LABELS[name] for name in REQUIRED_COLUMNS if columns[name] is None]
+            score = len(REQUIRED_COLUMNS) - len(missing)
+            candidate = (score, -header_row, headers, missing)
             if best is None or candidate[:2] > best[:2]:
                 best = candidate
-    if best is None or best[0] < 4:
-        raise CalculationError("找不到业务数据 Sheet：至少需要定点编码、险种类型、医疗费总额、基金支付总额、符合范围金额等表头。")
-    return best[2], best[3], best[4]
+        if best is None:
+            continue
+        if not best[3]:
+            valid.append((sheet, -best[1], best[2]))
+        else:
+            diagnostics.append(f"{sheet.title}：缺少" + "、".join(best[3]))
+
+    if len(valid) == 1:
+        return valid[0]
+    if len(valid) > 1:
+        names = "、".join(sheet.title for sheet, _, _ in valid)
+        raise CalculationError(f"检测到多个可用业务 Sheet：{names}。请在界面中明确选择源数据 Sheet。")
+    detail = "；".join(diagnostics[:5])
+    message = "找不到字段完整且唯一的业务数据 Sheet。"
+    raise CalculationError(message + (f" {detail}" if detail else ""))
 
 
 def insurance_bucket(insurance: Any) -> int | None:
@@ -163,34 +237,43 @@ def resolved_visit_type(raw: Any, selected: str, name: Any = None) -> str:
     raise CalculationError(f"无法从医疗类别识别住院或门诊：{value or '空值'}")
 
 
+def validate_options(options: RunOptions) -> None:
+    if options.rule_type not in {"通用", "串换"}:
+        raise CalculationError("请选择规则大类。")
+    if options.visit_type not in {"自动识别", "住院", "门诊"}:
+        raise CalculationError("请选择业务类型。")
+    if options.pooling_area not in FUND_RATES:
+        raise CalculationError("请选择参保地（住院报销比例）。")
+    if options.institution_level not in {"三级", "二级", "一级"}:
+        raise CalculationError("请选择医疗机构级别。")
+    for value, label in ((options.deduction_price, "扣减单价"), (options.deduction_quantity, "扣减数量")):
+        if value is not None and (not value.is_finite() or value < 0):
+            raise CalculationError(f"{label}必须是大于或等于 0 的有限数字。")
+    if options.rule_type == "串换" and options.deduction_quantity is None:
+        raise CalculationError("串换规则必须填写扣减数量。")
+
+
 def run_file(path: Path, options: RunOptions) -> FileResult:
     if path.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise CalculationError("仅支持 .xlsx 和 .xlsm 文件。")
+    validate_options(options)
 
     keep_vba = path.suffix.lower() == ".xlsm"
     workbook = load_workbook(path, keep_vba=keep_vba)
-    source, header_row, headers = determine_source_sheet(workbook)
-    columns = {
-        "code": find_column(headers, ("定点编码", "医疗机构编码")),
-        "name": find_column(headers, ("定点名称", "医疗机构名称")),
-        "insurance": find_column(headers, ("险种类型", "险种类别", "INSUTYPE", "insutype")),
-        "medical_total": find_column(headers, ("医疗费总额", "医疗总额")),
-        "fund_total": find_column(headers, ("基金支付总额",)),
-        "scope_amount": find_column(headers, ("符合范围金额",)),
-        "visit_type": find_column(headers, ("医疗类别",)),
-        "visit_name": find_column(headers, ("医疗类别名称",)),
-        "violation_amount": find_column(headers, ("违规金额",)),
-        "price": find_column(headers, ("单价",)),
-        "quantity": find_column(headers, ("数量",)),
-    }
-    missing = [name for name in ("code", "insurance", "medical_total", "fund_total", "scope_amount", "quantity") if columns[name] is None]
+    try:
+        return calculate_workbook(workbook, path, options, keep_vba)
+    finally:
+        workbook.close()
+
+
+def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool) -> FileResult:
+    source, header_row, headers = determine_source_sheet(workbook, options.source_sheet)
+    columns = resolve_columns(headers)
+    missing = [name for name in REQUIRED_COLUMNS if columns[name] is None]
     if missing:
-        labels = {"code": "定点编码", "insurance": "险种类型", "medical_total": "医疗费总额", "fund_total": "基金支付总额", "scope_amount": "符合范围金额", "quantity": "数量"}
-        raise CalculationError("缺少必填列：" + "、".join(labels[name] for name in missing))
+        raise CalculationError("缺少必填列：" + "、".join(COLUMN_LABELS[name] for name in missing))
     if options.visit_type == "自动识别" and columns["visit_type"] is None:
         raise CalculationError("选择“自动识别”时，原表必须有“医疗类别”列。")
-    if options.rule_type == "串换" and options.deduction_quantity is None:
-        raise CalculationError("串换规则必须填写扣减数量。")
     if options.rule_type == "串换" and columns["violation_amount"] is None and options.deduction_price is None:
         raise CalculationError("串换规则且无“违规金额”列时，必须填写扣减单价。")
 
@@ -198,6 +281,7 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
     if output_name == OUTPUT_SHEET and OUTPUT_SHEET in workbook.sheetnames:
         del workbook[OUTPUT_SHEET]
     output = workbook.create_sheet(output_name)
+    output_name = output.title
 
     groups: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
     warnings: list[str] = []
@@ -279,11 +363,8 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
         total_fund += group["fund_amount"]
 
     write_output_sheet(output, path, source.title, options, groups, processed, successful, errors, total_fund, warnings, excluded)
-    try:
-        workbook.save(path)
-    except PermissionError as exc:
-        raise CalculationError(f"无法保存文件。请关闭 Excel 中已打开的工作簿后重试：{path.name}") from exc
-    return FileResult(path, output_name, processed, successful, errors, excluded, total_fund, warnings)
+    backup_path = save_workbook_safely(workbook, path, output_name, total_fund, keep_vba)
+    return FileResult(path, output_name, processed, successful, errors, excluded, total_fund, warnings, backup_path)
 
 
 def create_output_sheet_name(workbook, overwrite: bool) -> str:
@@ -291,6 +372,72 @@ def create_output_sheet_name(workbook, overwrite: bool) -> str:
         return OUTPUT_SHEET
     suffix = dt.datetime.now().strftime("%m%d_%H%M%S")
     return f"{OUTPUT_SHEET}_{suffix}"
+
+
+def next_backup_path(path: Path) -> Path:
+    timestamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    base = path.with_name(f"{path.stem}_测算前备份_{timestamp}{path.suffix}")
+    candidate = base
+    number = 2
+    while candidate.exists():
+        candidate = path.with_name(f"{path.stem}_测算前备份_{timestamp}_{number}{path.suffix}")
+        number += 1
+    return candidate
+
+
+def replace_with_backup(path: Path, temp_path: Path, backup_path: Path) -> None:
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        replace_file = kernel32.ReplaceFileW
+        replace_file.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_wchar_p,
+            ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+        ]
+        replace_file.restype = ctypes.c_int
+        if not replace_file(str(path), str(temp_path), str(backup_path), 1, None, None):
+            error = ctypes.get_last_error()
+            raise OSError(error, ctypes.FormatError(error), str(path))
+        return
+
+    shutil.copy2(path, backup_path)
+    os.replace(temp_path, path)
+
+
+def save_workbook_safely(workbook, path: Path, output_name: str, total_fund: Decimal, keep_vba: bool) -> Path:
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    backup_path: Path | None = None
+    try:
+        workbook.save(temp_path)
+        workbook.close()
+
+        verification = load_workbook(temp_path, read_only=True, data_only=True, keep_vba=keep_vba)
+        try:
+            if output_name not in verification.sheetnames:
+                raise CalculationError("保存校验失败：结果 Sheet 缺失，原文件未替换。")
+            saved_total = as_decimal(verification[output_name]["D5"].value, "保存后的基金金额合计")
+            if saved_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) != total_fund:
+                raise CalculationError("保存校验失败：基金金额合计不一致，原文件未替换。")
+        finally:
+            verification.close()
+
+        backup_path = next_backup_path(path)
+        replace_with_backup(path, temp_path, backup_path)
+        return backup_path
+    except PermissionError as exc:
+        raise CalculationError(f"无法替换原文件。请关闭 Excel 中已打开的工作簿后重试：{path.name}") from exc
+    except OSError as exc:
+        raise CalculationError(f"安全保存失败，原文件未替换：{exc}") from exc
+    finally:
+        workbook.close()
+        if temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                pass
 
 
 def write_output_sheet(output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict, processed: int, successful: int, errors: int, total_fund: Decimal, warnings: list[str], excluded: int) -> None:
@@ -392,14 +539,17 @@ class CalculatorApp(tk.Tk):
         self.geometry("760x610")
         self.minsize(680, 560)
         self.files: list[Path] = []
+        self.running = False
         self.rule_type = tk.StringVar(value="通用")
         self.visit_type = tk.StringVar(value="自动识别")
-        self.pooling_area = tk.StringVar(value="张家口市")
-        self.institution_level = tk.StringVar(value="三级")
+        self.pooling_area = tk.StringVar()
+        self.institution_level = tk.StringVar()
+        self.source_sheet = tk.StringVar(value=AUTO_SOURCE_SHEET)
         self.deduction_price = tk.StringVar()
         self.deduction_quantity = tk.StringVar()
         self.overwrite_result = tk.BooleanVar(value=False)
         self._build()
+        self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build(self) -> None:
         container = ttk.Frame(self, padding=16)
@@ -408,8 +558,10 @@ class CalculatorApp(tk.Tk):
         ttk.Label(container, text="先按结果维度汇总；住院使用 PDF 比例，门诊使用分组基金支付总额 ÷ 分组医疗费总额。", foreground="#555555").pack(anchor="w", pady=(4, 12))
         file_bar = ttk.Frame(container)
         file_bar.pack(fill="x")
-        ttk.Button(file_bar, text="选择 Excel 文件", command=self.pick_files).pack(side="left")
-        ttk.Button(file_bar, text="清空", command=self.clear_files).pack(side="left", padx=8)
+        self.pick_button = ttk.Button(file_bar, text="选择 Excel 文件", command=self.pick_files)
+        self.pick_button.pack(side="left")
+        self.clear_button = ttk.Button(file_bar, text="清空", command=self.clear_files)
+        self.clear_button.pack(side="left", padx=8)
         self.file_label = ttk.Label(file_bar, text="尚未选择文件")
         self.file_label.pack(side="left", padx=8)
 
@@ -419,11 +571,14 @@ class CalculatorApp(tk.Tk):
         self.add_combo(params, "业务类型", self.visit_type, ["自动识别", "住院", "门诊"], 0, 1)
         self.add_combo(params, "参保地（住院报销比例）", self.pooling_area, list(FUND_RATES), 1, 0)
         self.add_combo(params, "医疗机构级别", self.institution_level, ["三级", "二级", "一级"], 1, 1)
-        ttk.Label(params, text="扣减单价（仅串换无违规金额列时）").grid(row=2, column=0, sticky="w", pady=(10, 0))
-        ttk.Entry(params, textvariable=self.deduction_price, width=26).grid(row=2, column=1, sticky="ew", pady=(10, 0))
-        ttk.Label(params, text="扣减数量（串换必填）").grid(row=3, column=0, sticky="w", pady=(8, 0))
-        ttk.Entry(params, textvariable=self.deduction_quantity, width=26).grid(row=3, column=1, sticky="ew", pady=(8, 0))
-        ttk.Checkbutton(params, text="覆盖已有“基金测算”Sheet（否则自动新建带时间的 Sheet）", variable=self.overwrite_result).grid(row=4, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Label(params, text="源数据 Sheet").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.source_sheet_combo = ttk.Combobox(params, textvariable=self.source_sheet, values=[AUTO_SOURCE_SHEET], width=26)
+        self.source_sheet_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0))
+        ttk.Label(params, text="扣减单价（仅串换无违规金额列时）").grid(row=3, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(params, textvariable=self.deduction_price, width=26).grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        ttk.Label(params, text="扣减数量（串换必填）").grid(row=4, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(params, textvariable=self.deduction_quantity, width=26).grid(row=4, column=1, sticky="ew", pady=(8, 0))
+        ttk.Checkbutton(params, text="覆盖已有“基金测算”Sheet（否则自动新建带时间的 Sheet）", variable=self.overwrite_result).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
         params.columnconfigure(1, weight=1)
 
         controls = ttk.Frame(container)
@@ -445,6 +600,19 @@ class CalculatorApp(tk.Tk):
         selections = filedialog.askopenfilenames(title="选择需要测算的 Excel 文件", filetypes=[("Excel 文件", "*.xlsx *.xlsm")])
         self.files = [Path(item) for item in selections]
         self.file_label.configure(text=f"已选择 {len(self.files)} 个文件" if self.files else "尚未选择文件")
+        choices = [AUTO_SOURCE_SHEET]
+        if self.files:
+            first = self.files[0]
+            try:
+                workbook = load_workbook(first, read_only=True, keep_vba=first.suffix.lower() == ".xlsm")
+                try:
+                    choices.extend(sheet.title for sheet in workbook.worksheets if not sheet.title.startswith(OUTPUT_SHEET))
+                finally:
+                    workbook.close()
+            except Exception as exc:
+                messagebox.showerror("读取失败", f"无法读取第一个文件的 Sheet 列表：{exc}")
+        self.source_sheet_combo.configure(values=choices)
+        self.source_sheet.set(AUTO_SOURCE_SHEET)
 
     def clear_files(self) -> None:
         self.files = []
@@ -459,33 +627,48 @@ class CalculatorApp(tk.Tk):
                 self.rule_type.get(), self.visit_type.get(), self.pooling_area.get(), self.institution_level.get(),
                 optional_decimal(self.deduction_price.get(), "扣减单价"),
                 optional_decimal(self.deduction_quantity.get(), "扣减数量"), self.overwrite_result.get(),
+                None if self.source_sheet.get() in {"", AUTO_SOURCE_SHEET} else self.source_sheet.get(),
             )
+            validate_options(options)
         except CalculationError as exc:
             messagebox.showerror("参数错误", str(exc))
             return
+        self.running = True
         self.run_button.configure(state="disabled")
+        self.pick_button.configure(state="disabled")
+        self.clear_button.configure(state="disabled")
         self.write_log("开始处理...\n")
-        threading.Thread(target=self.worker, args=(options,), daemon=True).start()
+        threading.Thread(target=self.worker, args=(tuple(self.files), options), daemon=True).start()
 
-    def worker(self, options: RunOptions) -> None:
+    def worker(self, files: tuple[Path, ...], options: RunOptions) -> None:
         results: list[FileResult] = []
         failures: list[str] = []
-        for path in self.files:
+        for path in files:
             try:
                 result = run_file(path, options)
                 results.append(result)
-                self.after(0, self.write_log, f"完成：{path.name} → {result.sheet_name}；成功 {result.successful}，排除 {result.excluded}，异常 {result.errors}，基金金额 {result.total_fund:,.2f}\n")
+                backup = result.backup_path.name if result.backup_path else "未创建"
+                self.after(0, self.write_log, f"完成：{path.name} → {result.sheet_name}；成功 {result.successful}，排除 {result.excluded}，异常 {result.errors}，基金金额 {result.total_fund:,.2f}；备份 {backup}\n")
             except Exception as exc:  # Keep batch processing independent per file.
                 failures.append(f"{path.name}：{exc}")
                 self.after(0, self.write_log, f"失败：{path.name} → {exc}\n")
         self.after(0, self.done, results, failures)
 
     def done(self, results: list[FileResult], failures: list[str]) -> None:
+        self.running = False
         self.run_button.configure(state="normal")
+        self.pick_button.configure(state="normal")
+        self.clear_button.configure(state="normal")
         message = f"处理完成：成功 {len(results)} 个文件"
         if failures:
             message += f"，失败 {len(failures)} 个文件"
         messagebox.showinfo("完成", message)
+
+    def on_close(self) -> None:
+        if self.running:
+            messagebox.showwarning("正在处理", "文件正在计算和安全保存，请等待处理完成后再关闭程序。")
+            return
+        self.destroy()
 
     def write_log(self, message: str) -> None:
         self.log.configure(state="normal")
