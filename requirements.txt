@@ -1,2 +1,2 @@
 openpyxl==3.1.5
-pyinstaller
+pyinstaller==6.14.2

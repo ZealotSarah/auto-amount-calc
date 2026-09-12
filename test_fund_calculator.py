@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import zipfile
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,6 +20,23 @@ class CalculatorTests(unittest.TestCase):
             source.append(["H1", "城乡", 100, 50, 20, 21, 1])
         workbook.save(path)
         workbook.close()
+
+    @staticmethod
+    def set_formula_cached_value(path: Path, cell_reference: str, value: str) -> None:
+        with zipfile.ZipFile(path) as archive:
+            contents = {name: archive.read(name) for name in archive.namelist()}
+        sheet_name = "xl/worksheets/sheet1.xml"
+        xml = contents[sheet_name]
+        marker = f'r="{cell_reference}"'.encode()
+        start = xml.index(b"<c ", xml.index(marker) - 30)
+        end = xml.index(b"</c>", start) + len(b"</c>")
+        cell_xml = xml[start:end]
+        value_start = cell_xml.index(b"<v>") + len(b"<v>")
+        value_end = cell_xml.index(b"</v>", value_start)
+        contents[sheet_name] = xml[:start] + cell_xml[:value_start] + value.encode() + cell_xml[value_end:] + xml[end:]
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for name, data in contents.items():
+                archive.writestr(name, data)
 
     def test_insurance_exact_names_and_codes(self):
         for value in ("职工", "城镇职工基本医疗保险", "310", 310, 310.0):
@@ -96,8 +114,89 @@ class CalculatorTests(unittest.TestCase):
                 self.assertEqual(output.cell(rows["门诊"], 8).value, 0.5684)
                 self.assertEqual(output.cell(rows["住院"], 7).value, 11.37)
                 self.assertEqual(output.cell(rows["住院"], 8).value, 0.5684)
+                self.assertEqual(output["J3"].value, "0.8.0")
+                self.assertEqual(output["J6"].value, "普通汇总表（非 Excel 原生透视表）")
             finally:
                 saved.close()
+
+    def test_cached_formula_values_are_used_and_formulas_are_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "formula.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", "=50+50", 50, 20, 21, 1])
+            workbook.save(path)
+            workbook.close()
+            self.set_formula_cached_value(path, "C2", "100")
+
+            result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+            self.assertEqual(result.total_fund, Decimal("11.37"))
+            saved = load_workbook(path, data_only=False)
+            try:
+                self.assertEqual(saved.active["C2"].value, "=50+50")
+            finally:
+                saved.close()
+
+    def test_uncached_formula_fails_with_actionable_message(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "uncached-formula.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", "=50+50", 50, 20, 21, 1])
+            workbook.save(path)
+            workbook.close()
+            original_bytes = path.read_bytes()
+
+            with self.assertRaisesRegex(CalculationError, "公式没有缓存结果"):
+                run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+            self.assertEqual(path.read_bytes(), original_bytes)
+
+    def test_institution_name_is_first_nonempty_name_for_every_group(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "names.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "定点名称", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", None, "城乡", 100, 50, 20, 11, 1])
+            source.append(["H1", "医院甲", "职工", 100, 50, 20, 21, 1])
+            workbook.save(path)
+            workbook.close()
+
+            run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+            saved = load_workbook(path, read_only=True, data_only=True)
+            try:
+                output = saved["基金测算"]
+                self.assertEqual(output["B8"].value, "医院甲")
+                self.assertEqual(output["B9"].value, "医院甲")
+            finally:
+                saved.close()
+
+    def test_all_failed_rows_fail_the_file_without_modifying_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "all-failed.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", 0, 50, 20, 11, 1])
+            workbook.save(path)
+            workbook.close()
+            original_bytes = path.read_bytes()
+
+            with self.assertRaisesRegex(CalculationError, "没有成功计算的明细"):
+                run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+            self.assertEqual(path.read_bytes(), original_bytes)
+            self.assertFalse(list(path.parent.glob("*_测算前备份_*.xlsx")))
+
+    def test_substitution_without_violation_requires_price_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "missing-price.xlsx"
+            self.make_source(path)
+            with self.assertRaisesRegex(CalculationError, "单价.*列"):
+                run_file(path, RunOptions("串换", "自动识别", "廊坊市", "三级", Decimal("1"), Decimal("1"), True))
 
     def test_substitution_sums_quantity_after_deduction(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -119,6 +218,8 @@ class CalculatorTests(unittest.TestCase):
             output = saved["基金测算"]
             self.assertEqual(output["F8"].value, 5)
             self.assertEqual(output["G8"].value, 17.05)
+            self.assertEqual(output["J4"].value, "未填写")
+            self.assertEqual(output["J5"].value, 2)
             saved.close()
 
     def test_code_priority_and_name_fallback(self):

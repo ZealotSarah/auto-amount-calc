@@ -10,10 +10,8 @@ import datetime as dt
 import os
 import re
 import shutil
-import sys
 import tempfile
 import threading
-import traceback
 from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -29,6 +27,7 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 
 RATE_VERSION = "24-25 年住院基金支付比例"
+APP_VERSION = "0.8.0"
 OUTPUT_SHEET = "基金测算"
 AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
 
@@ -274,8 +273,20 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
         raise CalculationError("缺少必填列：" + "、".join(COLUMN_LABELS[name] for name in missing))
     if options.visit_type == "自动识别" and columns["visit_type"] is None:
         raise CalculationError("选择“自动识别”时，原表必须有“医疗类别”列。")
-    if options.rule_type == "串换" and columns["violation_amount"] is None and options.deduction_price is None:
-        raise CalculationError("串换规则且无“违规金额”列时，必须填写扣减单价。")
+    if options.rule_type == "串换" and columns["violation_amount"] is None:
+        if columns["price"] is None:
+            raise CalculationError("串换规则且无“违规金额”列时，源数据必须有“单价”列。")
+        if options.deduction_price is None:
+            raise CalculationError("串换规则且无“违规金额”列时，必须填写扣减单价。")
+
+    numeric_columns = [columns[name] for name in ("medical_total", "fund_total", "scope_amount", "quantity", "violation_amount", "price") if columns[name]]
+    has_numeric_formulas = any(
+        source.cell(row, column).data_type == "f"
+        for row in range(header_row + 1, source.max_row + 1)
+        for column in numeric_columns
+    )
+    values_workbook = load_workbook(path, data_only=True, keep_vba=keep_vba) if has_numeric_formulas else None
+    value_source = values_workbook[source.title] if values_workbook else source
 
     output_name = create_output_sheet_name(workbook, options.overwrite_result)
     if output_name == OUTPUT_SHEET and OUTPUT_SHEET in workbook.sheetnames:
@@ -284,25 +295,39 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
     output_name = output.title
 
     groups: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
+    institution_names: dict[str, str] = {}
     warnings: list[str] = []
     processed = successful = errors = excluded = 0
-    for source_row, row in enumerate(source.iter_rows(min_row=header_row + 1, values_only=True), header_row + 1):
+    formula_rows = source.iter_rows(min_row=header_row + 1)
+    value_rows = value_source.iter_rows(min_row=header_row + 1, values_only=True)
+    for source_row, (formula_row, row) in enumerate(zip(formula_rows, value_rows), header_row + 1):
         if not any(cell is not None and str(cell).strip() for cell in row):
             continue
         processed += 1
         get = lambda name: row[columns[name] - 1] if columns[name] else None
+        get_cell = lambda name: formula_row[columns[name] - 1] if columns[name] else None
+
+        def get_decimal(name: str, label: str) -> Decimal:
+            value = get(name)
+            cell = get_cell(name)
+            if cell is not None and cell.data_type == "f" and (value is None or str(value).strip() == ""):
+                raise CalculationError(f"{label}公式没有缓存结果，请先用 Excel 打开并保存源文件")
+            return as_decimal(value, label)
+
         code = text_value(get("code")) or "未填写编码"
-        name = text_value(get("name")) or "未填写名称"
+        name = text_value(get("name"))
+        if name:
+            institution_names.setdefault(code, name)
         insurance = text_value(get("insurance")) or "未填写险种"
         bucket = insurance_bucket(insurance)
         if bucket is None:
             excluded += 1
             continue
         try:
-            medical_total = as_decimal(get("medical_total"), "医疗费总额")
-            fund_total = as_decimal(get("fund_total"), "基金支付总额")
-            scope_amount = as_decimal(get("scope_amount"), "符合范围金额")
-            quantity = as_decimal(get("quantity"), "数量")
+            medical_total = get_decimal("medical_total", "医疗费总额")
+            fund_total = get_decimal("fund_total", "基金支付总额")
+            scope_amount = get_decimal("scope_amount", "符合范围金额")
+            quantity = get_decimal("quantity", "数量")
             if medical_total < 0 or fund_total < 0 or scope_amount < 0 or quantity < 0:
                 raise CalculationError("医疗费总额、基金支付总额、符合范围金额和数量不能为负数")
             visit_type = resolved_visit_type(get("visit_type"), options.visit_type, get("visit_name"))
@@ -323,9 +348,9 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
                 if options.rule_type == "通用":
                     base = scope_amount
                 elif columns["violation_amount"] is not None:
-                    base = as_decimal(get("violation_amount"), "违规金额")
+                    base = get_decimal("violation_amount", "违规金额")
                 else:
-                    price = as_decimal(get("price"), "原单价")
+                    price = get_decimal("price", "原单价")
                     assert options.deduction_price is not None
                     result_price = price - options.deduction_price
                     if result_price < 0:
@@ -336,7 +361,7 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
 
             key = (code, insurance, visit_type)
             group = groups.setdefault(key, {
-                "name": name, "medical_total": Decimal("0"), "fund_total": Decimal("0"),
+                "name": "未填写名称", "medical_total": Decimal("0"), "fund_total": Decimal("0"),
                 "calculation_base": Decimal("0"), "quantity_total": Decimal("0"),
                 "fund_amount": Decimal("0"),
                 "types": {visit_type}, "rates": set(),
@@ -350,6 +375,15 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
             errors += 1
             if len(warnings) < 30:
                 warnings.append(f"第 {source_row} 行：{exc}")
+
+    if values_workbook:
+        values_workbook.close()
+    if successful == 0 and errors > 0:
+        detail = warnings[0] if warnings else "所有明细均计算失败"
+        raise CalculationError(f"没有成功计算的明细：{detail}")
+
+    for (code, _, _), group in groups.items():
+        group["name"] = institution_names.get(code, "未填写名称")
 
     total_fund = Decimal("0")
     for (_, insurance, visit_type), group in groups.items():
@@ -468,6 +502,18 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         output.cell(row, column + 1, value)
     output["D5"].number_format = "#,##0.00"
 
+    audit_metadata = [
+        ("生成时间", dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
+        ("工具版本", APP_VERSION),
+        ("扣减单价", options.deduction_price if options.deduction_price is not None else "未填写"),
+        ("扣减数量", options.deduction_quantity if options.deduction_quantity is not None else "未填写"),
+        ("输出形式", "普通汇总表（非 Excel 原生透视表）"),
+    ]
+    for row, (label, value) in enumerate(audit_metadata, 2):
+        output.cell(row, 9, label).font = Font(bold=True)
+        output.cell(row, 9).fill = blue
+        output.cell(row, 10, value)
+
     header_row = 7
     headers = ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "基金金额", "报销比例"]
     for column, header in enumerate(headers, 1):
@@ -506,6 +552,8 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
     output.column_dimensions["F"].width = 16
     output.column_dimensions["G"].width = 16
     output.column_dimensions["H"].width = 14
+    output.column_dimensions["I"].width = 18
+    output.column_dimensions["J"].width = 34
     output.freeze_panes = "A8"
     if warnings:
         output["A" + str(header_row + len(groups) + 3)] = "异常示例（最多显示 30 条）"
@@ -539,7 +587,7 @@ def unique_table_name(sheet) -> str:
 class CalculatorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("基金金额自动测算工具")
+        self.title(f"基金金额自动测算工具 v{APP_VERSION}")
         self.geometry("760x610")
         self.minsize(680, 560)
         self.files: list[Path] = []
