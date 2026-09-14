@@ -1,6 +1,6 @@
 """基金金额自动测算工具。
 
-结果 Sheet 仅输出用户约定的八列汇总字段。固定比例规则下住院和门诊
+结果 Sheet 仅输出用户约定的九列汇总字段。固定比例规则下住院和门诊
 均使用内置的《24年25年目录内（费用）住院基金支付比例》。
 """
 
@@ -8,10 +8,13 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import posixpath
 import re
 import shutil
 import tempfile
 import threading
+import zipfile
+import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -32,9 +35,14 @@ except ImportError:  # 无 GUI 环境（如无 Tk 的测试环境）下仍可导
 
 
 RATE_VERSION = "24-25 年住院基金支付比例"
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 OUTPUT_SHEET = "基金测算"
 AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
+SUMMARY_HEADERS = ("医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "人次", "基金金额", "报销比例")
+
+SPREADSHEET_NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+DOCUMENT_REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+PACKAGE_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 
 COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
     "code": ("定点编码", "医疗机构编码"),
@@ -176,7 +184,7 @@ def resolve_columns(headers: dict[str, list[int]]) -> dict[str, int | None]:
     }
 
 
-def determine_source_sheet(workbook, requested_sheet: str | None = None) -> tuple[Any, int, dict[str, list[int]]]:
+def determine_source_sheet(workbook, requested_sheet: str | None = None, required_columns: tuple[str, ...] = REQUIRED_COLUMNS) -> tuple[Any, int, dict[str, list[int]]]:
     if requested_sheet:
         if requested_sheet not in workbook.sheetnames:
             raise CalculationError(f"找不到指定的源数据 Sheet：{requested_sheet}")
@@ -195,8 +203,8 @@ def determine_source_sheet(workbook, requested_sheet: str | None = None) -> tupl
             except CalculationError as exc:
                 diagnostics.append(f"{sheet.title} 第 {header_row} 行：{exc}")
                 continue
-            missing = [COLUMN_LABELS[name] for name in REQUIRED_COLUMNS if columns[name] is None]
-            score = len(REQUIRED_COLUMNS) - len(missing)
+            missing = [COLUMN_LABELS[name] for name in required_columns if columns[name] is None]
+            score = len(required_columns) - len(missing)
             candidate = (score, -header_row, headers, missing)
             if best is None or candidate[:2] > best[:2]:
                 best = candidate
@@ -257,23 +265,108 @@ def validate_options(options: RunOptions) -> None:
         raise CalculationError("串换规则必须填写扣减数量。")
 
 
+def worksheet_parts(package: dict[str, bytes]) -> dict[str, str]:
+    workbook_root = ET.fromstring(package["xl/workbook.xml"])
+    relationships_root = ET.fromstring(package["xl/_rels/workbook.xml.rels"])
+    relationship_targets = {
+        relationship.attrib["Id"]: relationship.attrib["Target"]
+        for relationship in relationships_root.findall(f"{{{PACKAGE_REL_NS}}}Relationship")
+    }
+    parts: dict[str, str] = {}
+    for sheet in workbook_root.findall(f".//{{{SPREADSHEET_NS}}}sheet"):
+        relationship_id = sheet.attrib[f"{{{DOCUMENT_REL_NS}}}id"]
+        target = relationship_targets[relationship_id]
+        part = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+        parts[sheet.attrib["name"]] = part
+    return parts
+
+
+def capture_formula_caches(path: Path) -> dict[str, dict[str, tuple[str, str | None]]]:
+    with zipfile.ZipFile(path) as archive:
+        package = {name: archive.read(name) for name in archive.namelist()}
+    caches: dict[str, dict[str, tuple[str, str | None]]] = {}
+    for sheet_name, part in worksheet_parts(package).items():
+        root = ET.fromstring(package[part])
+        sheet_caches: dict[str, tuple[str, str | None]] = {}
+        for cell in root.findall(f".//{{{SPREADSHEET_NS}}}c"):
+            formula = cell.find(f"{{{SPREADSHEET_NS}}}f")
+            value = cell.find(f"{{{SPREADSHEET_NS}}}v")
+            if formula is not None and value is not None and value.text is not None:
+                sheet_caches[cell.attrib["r"]] = (value.text, cell.attrib.get("t"))
+        if sheet_caches:
+            caches[sheet_name] = sheet_caches
+    return caches
+
+
+def restore_formula_caches(path: Path, caches: dict[str, dict[str, tuple[str, str | None]]]) -> None:
+    if not caches:
+        return
+    with zipfile.ZipFile(path) as archive:
+        entries = [(item, archive.read(item.filename)) for item in archive.infolist()]
+    package = {item.filename: data for item, data in entries}
+    changed_parts: dict[str, bytes] = {}
+    for sheet_name, part in worksheet_parts(package).items():
+        sheet_caches = caches.get(sheet_name)
+        if not sheet_caches:
+            continue
+        root = ET.fromstring(package[part])
+        changed = False
+        for cell in root.findall(f".//{{{SPREADSHEET_NS}}}c"):
+            cached = sheet_caches.get(cell.attrib.get("r", ""))
+            formula = cell.find(f"{{{SPREADSHEET_NS}}}f")
+            if cached is None or formula is None:
+                continue
+            value = cell.find(f"{{{SPREADSHEET_NS}}}v")
+            if value is None:
+                value = ET.Element(f"{{{SPREADSHEET_NS}}}v")
+                children = list(cell)
+                cell.insert(children.index(formula) + 1, value)
+            value.text, cell_type = cached
+            if cell_type is None:
+                cell.attrib.pop("t", None)
+            else:
+                cell.attrib["t"] = cell_type
+            changed = True
+        if changed:
+            changed_parts[part] = ET.tostring(root, encoding="utf-8", xml_declaration=False)
+    if not changed_parts:
+        return
+
+    descriptor, rewritten_name = tempfile.mkstemp(prefix=f".{path.stem}_formula_", suffix=path.suffix, dir=path.parent)
+    os.close(descriptor)
+    rewritten_path = Path(rewritten_name)
+    try:
+        with zipfile.ZipFile(rewritten_path, "w") as archive:
+            for item, data in entries:
+                archive.writestr(item, changed_parts.get(item.filename, data))
+        os.replace(rewritten_path, path)
+    finally:
+        if rewritten_path.exists():
+            rewritten_path.unlink()
+
+
 def run_file(path: Path, options: RunOptions) -> FileResult:
     if path.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise CalculationError("仅支持 .xlsx 和 .xlsm 文件。")
     validate_options(options)
 
     keep_vba = path.suffix.lower() == ".xlsm"
+    formula_caches = capture_formula_caches(path)
     workbook = load_workbook(path, keep_vba=keep_vba)
     try:
-        return calculate_workbook(workbook, path, options, keep_vba)
+        return calculate_workbook(workbook, path, options, keep_vba, formula_caches)
     finally:
         workbook.close()
 
 
-def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool) -> FileResult:
-    source, header_row, headers = determine_source_sheet(workbook, options.source_sheet)
+def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool, formula_caches: dict[str, dict[str, tuple[str, str | None]]] | None = None) -> FileResult:
+    required_columns = tuple(
+        name for name in REQUIRED_COLUMNS
+        if not (options.rule_type == "固定比例" and name == "fund_total")
+    )
+    source, header_row, headers = determine_source_sheet(workbook, options.source_sheet, required_columns)
     columns = resolve_columns(headers)
-    missing = [name for name in REQUIRED_COLUMNS if columns[name] is None]
+    missing = [name for name in required_columns if columns[name] is None]
     if missing:
         raise CalculationError("缺少必填列：" + "、".join(COLUMN_LABELS[name] for name in missing))
     if options.visit_type == "自动识别" and columns["visit_type"] is None:
@@ -330,7 +423,7 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
             continue
         try:
             medical_total = get_decimal("medical_total", "医疗费总额")
-            fund_total = get_decimal("fund_total", "基金支付总额")
+            fund_total = Decimal("0") if options.rule_type == "固定比例" else get_decimal("fund_total", "基金支付总额")
             scope_amount = get_decimal("scope_amount", "符合范围金额")
             quantity = get_decimal("quantity", "数量")
             if medical_total < 0 or fund_total < 0 or scope_amount < 0 or quantity < 0:
@@ -412,7 +505,10 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
         raise CalculationError(f"人次勾稽校验失败：分组人次合计 {total_count} 与计算成功数 {successful} 不一致。")
 
     write_output_sheet(output, path, source.title, options, groups, processed, successful, errors, total_fund, warnings, excluded)
-    backup_path = save_workbook_safely(workbook, path, output_name, total_fund, keep_vba)
+    backup_path = save_workbook_safely(
+        workbook, path, output_name, total_fund, successful, len(groups), keep_vba,
+        formula_caches or {},
+    )
     return FileResult(path, output_name, processed, successful, errors, excluded, total_fund, warnings, backup_path)
 
 
@@ -454,7 +550,19 @@ def replace_with_backup(path: Path, temp_path: Path, backup_path: Path) -> None:
     os.replace(temp_path, path)
 
 
-def save_workbook_safely(workbook, path: Path, output_name: str, total_fund: Decimal, keep_vba: bool) -> Path:
+def labeled_value(sheet, label: str, max_row: int = 6, max_column: int = 11) -> Any:
+    for row in sheet.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_column):
+        for cell in row:
+            if cell.value == label:
+                return sheet.cell(cell.row, cell.column + 1).value
+    raise CalculationError(f"保存校验失败：找不到“{label}”，原文件未替换。")
+
+
+def save_workbook_safely(
+    workbook, path: Path, output_name: str, total_fund: Decimal, successful: int,
+    group_count: int, keep_vba: bool,
+    formula_caches: dict[str, dict[str, tuple[str, str | None]]],
+) -> Path:
     descriptor, temp_name = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=path.suffix, dir=path.parent)
     os.close(descriptor)
     temp_path = Path(temp_name)
@@ -462,14 +570,27 @@ def save_workbook_safely(workbook, path: Path, output_name: str, total_fund: Dec
     try:
         workbook.save(temp_path)
         workbook.close()
+        restore_formula_caches(temp_path, formula_caches)
 
         verification = load_workbook(temp_path, read_only=True, data_only=True, keep_vba=keep_vba)
         try:
             if output_name not in verification.sheetnames:
                 raise CalculationError("保存校验失败：结果 Sheet 缺失，原文件未替换。")
-            saved_total = as_decimal(verification[output_name]["D5"].value, "保存后的基金金额合计")
+            saved_output = verification[output_name]
+            saved_headers = tuple(saved_output.cell(7, column).value for column in range(1, len(SUMMARY_HEADERS) + 1))
+            if saved_headers != SUMMARY_HEADERS:
+                raise CalculationError("保存校验失败：九列汇总表头不一致，原文件未替换。")
+            saved_total = as_decimal(labeled_value(saved_output, "基金金额合计"), "保存后的基金金额合计")
             if saved_total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) != total_fund:
                 raise CalculationError("保存校验失败：基金金额合计不一致，原文件未替换。")
+            saved_count = sum(
+                int(as_decimal(saved_output.cell(row, 7).value, "保存后的人次"))
+                for row in range(8, 8 + group_count)
+            )
+            if saved_count != successful:
+                raise CalculationError(
+                    f"保存校验失败：人次合计 {saved_count} 与计算成功数 {successful} 不一致，原文件未替换。"
+                )
         finally:
             verification.close()
 
@@ -526,8 +647,7 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         output.cell(row, 11, value)
 
     header_row = 7
-    headers = ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "人次", "基金金额", "报销比例"]
-    for column, header in enumerate(headers, 1):
+    for column, header in enumerate(SUMMARY_HEADERS, 1):
         cell = output.cell(header_row, column, header)
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = navy
