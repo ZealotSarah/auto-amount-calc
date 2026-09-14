@@ -18,16 +18,21 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any, Iterable
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-
 from openpyxl import load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError:  # 无 GUI 环境（如无 Tk 的测试环境）下仍可导入核心计算逻辑。
+    import types
+    tk = types.SimpleNamespace(Tk=object)
+    filedialog = messagebox = ttk = None
+
 
 RATE_VERSION = "24-25 年住院基金支付比例"
-APP_VERSION = "0.8.1"
+APP_VERSION = "0.9.0"
 OUTPUT_SHEET = "基金测算"
 AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
 
@@ -363,6 +368,7 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
             group = groups.setdefault(key, {
                 "name": "未填写名称", "medical_total": Decimal("0"), "fund_total": Decimal("0"),
                 "calculation_base": Decimal("0"), "quantity_total": Decimal("0"),
+                "count": 0,
                 "fund_amount": Decimal("0"),
                 "types": {visit_type}, "rates": set(),
             })
@@ -370,6 +376,7 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
             group["fund_total"] += fund_total
             group["calculation_base"] += base
             group["quantity_total"] += result_quantity
+            group["count"] += 1
             successful += 1
         except CalculationError as exc:
             errors += 1
@@ -386,6 +393,7 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
         group["name"] = institution_names.get(code, "未填写名称")
 
     total_fund = Decimal("0")
+    total_count = 0
     for (_, insurance, visit_type), group in groups.items():
         bucket = insurance_bucket(insurance)
         assert bucket is not None
@@ -399,6 +407,9 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
         group["fund_amount"] = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         group["rates"].add(rate)
         total_fund += group["fund_amount"]
+        total_count += group["count"]
+    if total_count != successful:
+        raise CalculationError(f"人次勾稽校验失败：分组人次合计 {total_count} 与计算成功数 {successful} 不一致。")
 
     write_output_sheet(output, path, source.title, options, groups, processed, successful, errors, total_fund, warnings, excluded)
     backup_path = save_workbook_safely(workbook, path, output_name, total_fund, keep_vba)
@@ -481,7 +492,7 @@ def save_workbook_safely(workbook, path: Path, output_name: str, total_fund: Dec
 def write_output_sheet(output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict, processed: int, successful: int, errors: int, total_fund: Decimal, warnings: list[str], excluded: int) -> None:
     navy = PatternFill("solid", fgColor="1F4E78")
     blue = PatternFill("solid", fgColor="D9EAF7")
-    output.merge_cells("A1:H1")
+    output.merge_cells("A1:I1")
     output["A1"] = "基金金额测算结果"
     output["A1"].font = Font(size=14, bold=True, color="FFFFFF")
     output["A1"].fill = navy
@@ -510,12 +521,12 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         ("输出形式", "普通汇总表（非 Excel 原生透视表）"),
     ]
     for row, (label, value) in enumerate(audit_metadata, 2):
-        output.cell(row, 9, label).font = Font(bold=True)
-        output.cell(row, 9).fill = blue
-        output.cell(row, 10, value)
+        output.cell(row, 10, label).font = Font(bold=True)
+        output.cell(row, 10).fill = blue
+        output.cell(row, 11, value)
 
     header_row = 7
-    headers = ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "基金金额", "报销比例"]
+    headers = ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "人次", "基金金额", "报销比例"]
     for column, header in enumerate(headers, 1):
         cell = output.cell(header_row, column, header)
         cell.font = Font(bold=True, color="FFFFFF")
@@ -529,16 +540,18 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         output.cell(row_number, 4, visit_type)
         output.cell(row_number, 5, float(group["medical_total"]))
         output.cell(row_number, 6, float(group["quantity_total"]))
-        output.cell(row_number, 7, float(group["fund_amount"]))
-        output.cell(row_number, 8, float(rate) if isinstance(rate, Decimal) else rate)
+        output.cell(row_number, 7, group["count"])
+        output.cell(row_number, 8, float(group["fund_amount"]))
+        output.cell(row_number, 9, float(rate) if isinstance(rate, Decimal) else rate)
         output.cell(row_number, 5).number_format = "#,##0.00"
         output.cell(row_number, 6).number_format = "#,##0.####"
-        output.cell(row_number, 7).number_format = "#,##0.00"
+        output.cell(row_number, 7).number_format = "#,##0"
+        output.cell(row_number, 8).number_format = "#,##0.00"
         if isinstance(rate, Decimal):
-            output.cell(row_number, 8).number_format = "0.00%"
+            output.cell(row_number, 9).number_format = "0.00%"
     if groups:
         last_row = header_row + len(groups)
-        table = Table(displayName=unique_table_name(output), ref=f"A{header_row}:H{last_row}")
+        table = Table(displayName=unique_table_name(output), ref=f"A{header_row}:I{last_row}")
         table.tableStyleInfo = TableStyleInfo(name="TableStyleMedium2", showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
         output.add_table(table)
     else:
@@ -550,17 +563,18 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
     output.column_dimensions["D"].width = 14
     output.column_dimensions["E"].width = 16
     output.column_dimensions["F"].width = 16
-    output.column_dimensions["G"].width = 16
-    output.column_dimensions["H"].width = 14
-    output.column_dimensions["I"].width = 18
-    output.column_dimensions["J"].width = 34
+    output.column_dimensions["G"].width = 12
+    output.column_dimensions["H"].width = 16
+    output.column_dimensions["I"].width = 14
+    output.column_dimensions["J"].width = 18
+    output.column_dimensions["K"].width = 34
     output.freeze_panes = "A8"
     if warnings:
         output["A" + str(header_row + len(groups) + 3)] = "异常示例（最多显示 30 条）"
         output["A" + str(header_row + len(groups) + 3)].font = Font(bold=True, color="C00000")
         for offset, warning in enumerate(warnings, 4):
             output["A" + str(header_row + len(groups) + offset)] = warning
-            output.merge_cells(start_row=header_row + len(groups) + offset, start_column=1, end_row=header_row + len(groups) + offset, end_column=8)
+            output.merge_cells(start_row=header_row + len(groups) + offset, start_column=1, end_row=header_row + len(groups) + offset, end_column=9)
 
 
 def group_rate(group: dict[str, Any]) -> Decimal | str:

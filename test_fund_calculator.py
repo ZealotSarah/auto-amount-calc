@@ -88,11 +88,13 @@ class CalculatorTests(unittest.TestCase):
             saved = load_workbook(path, data_only=True)
             output = saved["基金测算"]
             self.assertEqual(output["F8"].value, 7)
-            self.assertEqual(output["G8"].value, 50)
-            self.assertEqual(output["H8"].value, 0.5)
+            self.assertEqual(output["G8"].value, 2)
+            self.assertEqual(output["H8"].value, 50)
+            self.assertEqual(output["I8"].value, 0.5)
             self.assertEqual(output["F9"].value, 11)
-            self.assertEqual(output["G9"].value, 0.01)
-            self.assertEqual(next(iter(output.tables.values())).ref, "A7:H9")
+            self.assertEqual(output["G9"].value, 2)
+            self.assertEqual(output["H9"].value, 0.01)
+            self.assertEqual(next(iter(output.tables.values())).ref, "A7:I9")
             saved.close()
 
     def test_fixed_rate_uses_same_rate_for_inpatient_and_outpatient(self):
@@ -113,12 +115,12 @@ class CalculatorTests(unittest.TestCase):
             try:
                 output = saved["基金测算"]
                 rows = {output.cell(row, 4).value: row for row in (8, 9)}
-                self.assertEqual(output.cell(rows["门诊"], 7).value, 11.37)
-                self.assertEqual(output.cell(rows["门诊"], 8).value, 0.5684)
-                self.assertEqual(output.cell(rows["住院"], 7).value, 11.37)
-                self.assertEqual(output.cell(rows["住院"], 8).value, 0.5684)
-                self.assertEqual(output["J3"].value, "0.8.1")
-                self.assertEqual(output["J6"].value, "普通汇总表（非 Excel 原生透视表）")
+                self.assertEqual(output.cell(rows["门诊"], 8).value, 11.37)
+                self.assertEqual(output.cell(rows["门诊"], 9).value, 0.5684)
+                self.assertEqual(output.cell(rows["住院"], 8).value, 11.37)
+                self.assertEqual(output.cell(rows["住院"], 9).value, 0.5684)
+                self.assertEqual(output["K3"].value, "0.9.0")
+                self.assertEqual(output["K6"].value, "普通汇总表（非 Excel 原生透视表）")
             finally:
                 saved.close()
 
@@ -220,9 +222,9 @@ class CalculatorTests(unittest.TestCase):
             saved = load_workbook(path, data_only=True)
             output = saved["基金测算"]
             self.assertEqual(output["F8"].value, 5)
-            self.assertEqual(output["G8"].value, 17.05)
-            self.assertEqual(output["J4"].value, "未填写")
-            self.assertEqual(output["J5"].value, 2)
+            self.assertEqual(output["H8"].value, 17.05)
+            self.assertEqual(output["K4"].value, "未填写")
+            self.assertEqual(output["K5"].value, 2)
             saved.close()
 
     def test_code_priority_and_name_fallback(self):
@@ -263,9 +265,9 @@ class CalculatorTests(unittest.TestCase):
             self.assertEqual(output["F5"].value, 3)
             self.assertEqual(sum(output.cell(row, 5).value for row in (8, 9)), 300)
             self.assertEqual(output["F8"].value, 2)
-            self.assertEqual(output["H8"].value, 0.5)
+            self.assertEqual(output["I8"].value, 0.5)
             self.assertEqual(output["F9"].value, 3)
-            self.assertEqual(output["H9"].value, 0.5684)
+            self.assertEqual(output["I9"].value, 0.5684)
             saved.close()
 
     def test_name_only_column(self):
@@ -375,9 +377,96 @@ class CalculatorTests(unittest.TestCase):
             try:
                 output = saved["基金测算"]
                 self.assertEqual({output.cell(row, 2).value for row in range(8, 11)}, {"脱敏医院乙"})
-                self.assertEqual({output.cell(row, 8).value for row in range(8, 10)}, {0.5684})
+                self.assertEqual({output.cell(row, 9).value for row in range(8, 10)}, {0.5684})
             finally:
                 saved.close()
+
+    def test_visit_count_does_not_dedupe_same_person(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "dedupe.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            # 同一人员（相同编码/身份）出现 3 条明细，人次应计 3，不去重。
+            source.append(["H1", "城乡", 100, 50, 20, 21, 1])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 1])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 1])
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+            self.assertEqual(result.successful, 3)
+            saved = load_workbook(path, data_only=True)
+            output = saved["基金测算"]
+            self.assertEqual(output["G8"].value, 3)
+            saved.close()
+
+    def test_visit_count_unchanged_by_substitution_deduction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "subst-count.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量", "违规金额"])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 5, 10])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 4, 20])
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions("串换", "自动识别", "廊坊市", "三级", None, Decimal("2"), True))
+
+            self.assertEqual(result.successful, 2)
+            saved = load_workbook(path, data_only=True)
+            output = saved["基金测算"]
+            self.assertEqual(output["G8"].value, 2)
+            self.assertEqual(output["F8"].value, 5)
+            saved.close()
+
+    def test_visit_count_sum_equals_successful(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "count-sum.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 1])
+            source.append(["H1", "城乡", 100, 50, 20, 11, 1])
+            source.append(["H2", "职工", 100, 50, 20, 21, 1])
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+            self.assertEqual(result.successful, 3)
+            saved = load_workbook(path, data_only=True)
+            output = saved["基金测算"]
+            count_total = sum(output.cell(row, 7).value for row in range(8, 11))
+            self.assertEqual(count_total, result.successful)
+            saved.close()
+
+    def test_nine_column_header_and_audit_position(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "nine-col.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(["定点编码", "险种类型", "医疗费总额", "基金支付总额", "符合范围金额", "医疗类别", "数量"])
+            source.append(["H1", "城乡", 100, 50, 20, 21, 1])
+            workbook.save(path)
+            workbook.close()
+
+            run_file(path, RunOptions("通用", "自动识别", "廊坊市", "三级", None, None, True))
+
+            saved = load_workbook(path, data_only=True)
+            output = saved["基金测算"]
+            self.assertEqual(output["A1"].value, "基金金额测算结果")
+            self.assertEqual(
+                [output.cell(7, column).value for column in range(1, 10)],
+                ["医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "人次", "基金金额", "报销比例"],
+            )
+            self.assertEqual(next(iter(output.tables.values())).ref, "A7:I8")
+            self.assertEqual(output["G8"].value, 1)
+            self.assertEqual(output["J2"].value, "生成时间")
+            self.assertEqual(output["K3"].value, "0.9.0")
+            saved.close()
 
 
 if __name__ == "__main__":
