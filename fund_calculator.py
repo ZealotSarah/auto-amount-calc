@@ -35,7 +35,7 @@ except ImportError:  # 无 GUI 环境（如无 Tk 的测试环境）下仍可导
 
 
 RATE_VERSION = "24-25 年住院基金支付比例"
-APP_VERSION = "0.9.1"
+APP_VERSION = "1.0.0"
 OUTPUT_SHEET = "基金测算"
 AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
 SUMMARY_HEADERS = ("医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "人次", "基金金额", "报销比例")
@@ -65,6 +65,41 @@ COLUMN_LABELS = {
     "visit_name": "医疗类别名称", "violation_amount": "违规金额",
     "price": "单价", "quantity": "数量",
 }
+
+SIMULTANEOUS_SCOPES = ("同日同时同分", "同日同时", "同日", "同一次住院")
+PAIR_COLUMN_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "code": ("定点编码", "医疗机构编码"),
+    "name": ("定点名称", "医疗机构名称"),
+    "insurance": ("险种类型", "险种类别", "INSUTYPE", "insutype"),
+    "medical_total": ("医疗费总额", "医疗总额"),
+    "fund_total": ("基金支付总额",),
+    "visit_type": ("医疗类别编码", "医疗类别代码"),
+    "visit_name": ("医疗类别名称", "医疗类别"),
+    "visit_id": ("就诊ID", "MDTRT_ID", "mdtrt_id"),
+    "item_code1": ("医保目录编码1",),
+    "item_name1": ("医保目录名称1",),
+    "price1": ("单价1",),
+    "time1": ("处方日期1", "费用发生时间1"),
+    "quantity1": ("数量1",),
+    "item_code2": ("医保目录编码2",),
+    "item_name2": ("医保目录名称2",),
+    "price2": ("单价2",),
+    "time2": ("处方日期2", "费用发生时间2"),
+    "quantity2": ("数量2",),
+}
+PAIR_COLUMN_LABELS = {
+    "code": "定点编码", "name": "定点名称", "insurance": "险种类型",
+    "medical_total": "医疗费总额", "fund_total": "基金支付总额",
+    "visit_type": "医疗类别", "visit_name": "医疗类别名称", "visit_id": "就诊ID",
+    "item_code1": "医保目录编码1", "item_name1": "医保目录名称1",
+    "price1": "单价1", "time1": "处方日期1", "quantity1": "数量1",
+    "item_code2": "医保目录编码2", "item_name2": "医保目录名称2",
+    "price2": "单价2", "time2": "处方日期2", "quantity2": "数量2",
+}
+PAIR_REQUIRED_COLUMNS = (
+    "code", "insurance", "medical_total", "fund_total", "visit_id",
+    "price1", "time1", "quantity1", "price2", "time2", "quantity2",
+)
 
 # 统筹区: {医疗机构级别: (职工, 居民, 合计)}。数值为小数比例。
 FUND_RATES: dict[str, dict[str, tuple[Decimal, Decimal, Decimal]]] = {
@@ -101,6 +136,7 @@ class RunOptions:
     deduction_quantity: Decimal | None
     overwrite_result: bool
     source_sheet: str | None = None
+    simultaneous_scope: str = "同日同时同分"
 
 
 @dataclass
@@ -177,14 +213,23 @@ def find_column(headers: dict[str, list[int]], candidates: Iterable[str], label:
     return prefix_matches[0][1] if prefix_matches else None
 
 
-def resolve_columns(headers: dict[str, list[int]]) -> dict[str, int | None]:
+def resolve_columns(
+    headers: dict[str, list[int]],
+    candidates_by_name: dict[str, tuple[str, ...]] = COLUMN_CANDIDATES,
+    labels: dict[str, str] = COLUMN_LABELS,
+) -> dict[str, int | None]:
     return {
-        name: find_column(headers, candidates, COLUMN_LABELS[name])
-        for name, candidates in COLUMN_CANDIDATES.items()
+        name: find_column(headers, candidates, labels[name])
+        for name, candidates in candidates_by_name.items()
     }
 
 
-def determine_source_sheet(workbook, requested_sheet: str | None = None, required_columns: tuple[str, ...] = REQUIRED_COLUMNS) -> tuple[Any, int, dict[str, list[int]]]:
+def determine_source_sheet(
+    workbook, requested_sheet: str | None = None,
+    required_columns: tuple[str, ...] = REQUIRED_COLUMNS,
+    candidates_by_name: dict[str, tuple[str, ...]] = COLUMN_CANDIDATES,
+    labels: dict[str, str] = COLUMN_LABELS,
+) -> tuple[Any, int, dict[str, list[int]]]:
     if requested_sheet:
         if requested_sheet not in workbook.sheetnames:
             raise CalculationError(f"找不到指定的源数据 Sheet：{requested_sheet}")
@@ -199,11 +244,11 @@ def determine_source_sheet(workbook, requested_sheet: str | None = None, require
         for header_row in range(1, min(10, sheet.max_row) + 1):
             headers = collect_headers(sheet[header_row])
             try:
-                columns = resolve_columns(headers)
+                columns = resolve_columns(headers, candidates_by_name, labels)
             except CalculationError as exc:
                 diagnostics.append(f"{sheet.title} 第 {header_row} 行：{exc}")
                 continue
-            missing = [COLUMN_LABELS[name] for name in required_columns if columns[name] is None]
+            missing = [labels[name] for name in required_columns if columns[name] is None]
             score = len(required_columns) - len(missing)
             candidate = (score, -header_row, headers, missing)
             if best is None or candidate[:2] > best[:2]:
@@ -250,7 +295,7 @@ def resolved_visit_type(raw: Any, selected: str, name: Any = None) -> str:
 
 
 def validate_options(options: RunOptions) -> None:
-    if options.rule_type not in {"通用", "串换", "固定比例"}:
+    if options.rule_type not in {"通用", "串换", "固定比例", "两项同时收取"}:
         raise CalculationError("请选择规则大类。")
     if options.visit_type not in {"自动识别", "住院", "门诊"}:
         raise CalculationError("请选择业务类型。")
@@ -263,6 +308,8 @@ def validate_options(options: RunOptions) -> None:
             raise CalculationError(f"{label}必须是大于或等于 0 的有限数字。")
     if options.rule_type == "串换" and options.deduction_quantity is None:
         raise CalculationError("串换规则必须填写扣减数量。")
+    if options.simultaneous_scope not in SIMULTANEOUS_SCOPES:
+        raise CalculationError("请选择两项同时收取的同时口径。")
 
 
 def worksheet_parts(package: dict[str, bytes]) -> dict[str, str]:
@@ -345,6 +392,51 @@ def restore_formula_caches(path: Path, caches: dict[str, dict[str, tuple[str, st
             rewritten_path.unlink()
 
 
+def as_datetime(value: Any, label: str) -> dt.datetime:
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, dt.date):
+        return dt.datetime.combine(value, dt.time())
+    text = text_value(value)
+    if not text:
+        raise CalculationError(f"{label}为空")
+    normalized = text.replace("/", "-")
+    try:
+        return dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        pass
+    for pattern in ("%Y%m%d%H%M%S", "%Y%m%d %H%M%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(normalized, pattern)
+        except ValueError:
+            continue
+    raise CalculationError(f"{label}不是可识别的日期时间：{value}")
+
+
+def simultaneous_time_key(value: dt.datetime, scope: str) -> str:
+    if scope == "同日同时同分":
+        return value.strftime("%Y-%m-%d %H:%M")
+    if scope == "同日同时":
+        return value.strftime("%Y-%m-%d %H")
+    if scope == "同日":
+        return value.strftime("%Y-%m-%d")
+    return "同一次住院"
+
+
+def allocated_pair_amount(records: list[dict[str, Any]], side: int, paired_quantity: Decimal) -> Decimal:
+    remaining = paired_quantity
+    amount = Decimal("0")
+    for record in sorted(records, key=lambda item: (item[f"time{side}"], item["source_row"])):
+        if remaining == 0:
+            break
+        allocated = min(record[f"quantity{side}"], remaining)
+        amount += record[f"price{side}"] * allocated
+        remaining -= allocated
+    if remaining != 0:
+        raise CalculationError("配对数量分配失败")
+    return amount
+
+
 def run_file(path: Path, options: RunOptions) -> FileResult:
     if path.suffix.lower() not in {".xlsx", ".xlsm"}:
         raise CalculationError("仅支持 .xlsx 和 .xlsm 文件。")
@@ -360,6 +452,9 @@ def run_file(path: Path, options: RunOptions) -> FileResult:
 
 
 def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool, formula_caches: dict[str, dict[str, tuple[str, str | None]]] | None = None) -> FileResult:
+    if options.rule_type == "两项同时收取":
+        return calculate_simultaneous_workbook(workbook, path, options, keep_vba, formula_caches or {})
+
     required_columns = tuple(
         name for name in REQUIRED_COLUMNS
         if not (options.rule_type == "固定比例" and name == "fund_total")
@@ -512,6 +607,214 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
     return FileResult(path, output_name, processed, successful, errors, excluded, total_fund, warnings, backup_path)
 
 
+def calculate_simultaneous_workbook(
+    workbook, path: Path, options: RunOptions, keep_vba: bool,
+    formula_caches: dict[str, dict[str, tuple[str, str | None]]],
+) -> FileResult:
+    source, header_row, headers = determine_source_sheet(
+        workbook, options.source_sheet, PAIR_REQUIRED_COLUMNS,
+        PAIR_COLUMN_CANDIDATES, PAIR_COLUMN_LABELS,
+    )
+    columns = resolve_columns(headers, PAIR_COLUMN_CANDIDATES, PAIR_COLUMN_LABELS)
+    missing = [name for name in PAIR_REQUIRED_COLUMNS if columns[name] is None]
+    if missing:
+        raise CalculationError("缺少两项同时收取必填列：" + "、".join(PAIR_COLUMN_LABELS[name] for name in missing))
+    if options.visit_type == "自动识别" and columns["visit_type"] is None and columns["visit_name"] is None:
+        raise CalculationError("选择“自动识别”时，原表必须有“医疗类别编码”或“医疗类别”列。")
+
+    numeric_columns = [
+        columns[name] for name in ("medical_total", "fund_total", "price1", "quantity1", "price2", "quantity2")
+        if columns[name]
+    ]
+    has_numeric_formulas = any(
+        source.cell(row, column).data_type == "f"
+        for row in range(header_row + 1, source.max_row + 1)
+        for column in numeric_columns
+    )
+    values_workbook = load_workbook(path, data_only=True, keep_vba=keep_vba) if has_numeric_formulas else None
+    value_source = values_workbook[source.title] if values_workbook else source
+
+    output_name = create_output_sheet_name(workbook, options.overwrite_result)
+    if output_name == OUTPUT_SHEET and OUTPUT_SHEET in workbook.sheetnames:
+        del workbook[OUTPUT_SHEET]
+    output = workbook.create_sheet(output_name)
+    output_name = output.title
+
+    pair_groups: OrderedDict[tuple[str, str, str, str, str], dict[str, Any]] = OrderedDict()
+    visit_totals: dict[tuple[str, str], dict[str, Any]] = {}
+    institution_names: dict[str, str] = {}
+    warnings: list[str] = []
+    processed = errors = excluded = 0
+    fatal_error: str | None = None
+    formula_rows = source.iter_rows(min_row=header_row + 1)
+    value_rows = value_source.iter_rows(min_row=header_row + 1, values_only=True)
+    for source_row, (formula_row, row) in enumerate(zip(formula_rows, value_rows), header_row + 1):
+        if not any(cell is not None and str(cell).strip() for cell in row):
+            continue
+        processed += 1
+        get = lambda name: row[columns[name] - 1] if columns[name] else None
+        get_cell = lambda name: formula_row[columns[name] - 1] if columns[name] else None
+
+        def get_decimal(name: str, label: str) -> Decimal:
+            value = get(name)
+            cell = get_cell(name)
+            if cell is not None and cell.data_type == "f" and (value is None or str(value).strip() == ""):
+                raise CalculationError(f"{label}公式没有缓存结果，请先用 Excel 打开并保存源文件")
+            return as_decimal(value, label)
+
+        code = text_value(get("code")) or "未填写编码"
+        name = text_value(get("name"))
+        if name:
+            institution_names.setdefault(code, name)
+        insurance = text_value(get("insurance")) or "未填写险种"
+        bucket = insurance_bucket(insurance)
+        if bucket is None:
+            excluded += 1
+            continue
+        try:
+            visit_id = text_value(get("visit_id"))
+            if not visit_id:
+                raise CalculationError("就诊ID为空")
+            visit_type = resolved_visit_type(get("visit_type"), options.visit_type, get("visit_name"))
+            if options.simultaneous_scope == "同一次住院" and visit_type != "住院":
+                raise CalculationError("“同一次住院”口径仅适用于住院记录")
+
+            medical_total = get_decimal("medical_total", "医疗费总额")
+            fund_total = get_decimal("fund_total", "基金支付总额")
+            price1 = get_decimal("price1", "单价1")
+            quantity1 = get_decimal("quantity1", "数量1")
+            price2 = get_decimal("price2", "单价2")
+            quantity2 = get_decimal("quantity2", "数量2")
+            if medical_total < 0 or fund_total < 0 or price1 < 0 or price2 < 0:
+                raise CalculationError("医疗费总额、基金支付总额和两个项目单价不能为负数")
+            if quantity1 <= 0 or quantity2 <= 0:
+                raise CalculationError("两个项目数量必须大于 0")
+            if visit_type == "门诊" and medical_total == 0:
+                raise CalculationError("门诊医疗费总额为 0，无法计算")
+
+            time1 = as_datetime(get("time1"), "处方日期1")
+            time2 = as_datetime(get("time2"), "处方日期2")
+            time_key1 = simultaneous_time_key(time1, options.simultaneous_scope)
+            time_key2 = simultaneous_time_key(time2, options.simultaneous_scope)
+            if time_key1 != time_key2:
+                raise CalculationError(f"两个项目不符合“{options.simultaneous_scope}”口径")
+
+            visit_key = (code, visit_id)
+            existing_visit = visit_totals.get(visit_key)
+            visit_data = {
+                "insurance": insurance, "visit_type": visit_type,
+                "medical_total": medical_total, "fund_total": fund_total,
+            }
+            if existing_visit is not None and existing_visit != visit_data:
+                fatal_error = f"就诊ID {visit_id} 的险种、医疗类别或结算金额不一致"
+                raise CalculationError(fatal_error)
+            visit_totals.setdefault(visit_key, visit_data)
+
+            item1_identity = text_value(get("item_code1")) or text_value(get("item_name1"))
+            item2_identity = text_value(get("item_code2")) or text_value(get("item_name2"))
+            if not item1_identity or not item2_identity:
+                raise CalculationError("两个项目的目录编码和名称不能同时为空")
+            if item1_identity == item2_identity:
+                raise CalculationError("项目1和项目2不能是同一项目")
+            pair_key = (code, visit_id, time_key1, item1_identity, item2_identity)
+            pair = pair_groups.setdefault(pair_key, {
+                "insurance": insurance, "visit_type": visit_type, "records": [], "fingerprints": set(),
+            })
+            if pair["insurance"] != insurance or pair["visit_type"] != visit_type:
+                fatal_error = f"就诊ID {visit_id} 的同一匹配范围出现不同险种或医疗类别"
+                raise CalculationError(fatal_error)
+            fingerprint = (
+                text_value(get("item_code1")), text_value(get("item_name1")), price1, quantity1, time1,
+                text_value(get("item_code2")), text_value(get("item_name2")), price2, quantity2, time2,
+            )
+            if fingerprint in pair["fingerprints"]:
+                raise CalculationError("检测到完全重复的两项配对明细，已忽略重复行")
+            pair["fingerprints"].add(fingerprint)
+            pair["records"].append({
+                "source_row": source_row, "time1": time1, "time2": time2,
+                "price1": price1, "quantity1": quantity1,
+                "price2": price2, "quantity2": quantity2,
+            })
+        except CalculationError as exc:
+            errors += 1
+            if len(warnings) < 30:
+                warnings.append(f"第 {source_row} 行：{exc}")
+
+    if values_workbook:
+        values_workbook.close()
+    if fatal_error:
+        raise CalculationError(fatal_error)
+
+    groups: OrderedDict[tuple[str, str, str], dict[str, Any]] = OrderedDict()
+    summary_visits: dict[tuple[str, str, str], set[tuple[str, str]]] = {}
+    successful = 0
+    paired_quantity_total = Decimal("0")
+    unmatched_quantity_total = Decimal("0")
+    for (code, visit_id, _, _, _), pair in pair_groups.items():
+        records = pair["records"]
+        if not records:
+            continue
+        quantity1 = sum((record["quantity1"] for record in records), Decimal("0"))
+        quantity2 = sum((record["quantity2"] for record in records), Decimal("0"))
+        paired_quantity = min(quantity1, quantity2)
+        if paired_quantity <= 0:
+            continue
+        base = allocated_pair_amount(records, 1, paired_quantity) + allocated_pair_amount(records, 2, paired_quantity)
+        summary_key = (code, pair["insurance"], pair["visit_type"])
+        group = groups.setdefault(summary_key, {
+            "name": institution_names.get(code, "未填写名称"),
+            "medical_total": Decimal("0"), "fund_total": Decimal("0"),
+            "calculation_base": Decimal("0"), "quantity_total": Decimal("0"),
+            "count": 0, "fund_amount": Decimal("0"),
+            "types": {pair["visit_type"]}, "rates": set(),
+        })
+        group["calculation_base"] += base
+        group["quantity_total"] += paired_quantity * 2
+        group["count"] += 1
+        summary_visits.setdefault(summary_key, set()).add((code, visit_id))
+        paired_quantity_total += paired_quantity
+        unmatched_quantity_total += quantity1 + quantity2 - paired_quantity * 2
+        successful += 1
+
+    for summary_key, visits in summary_visits.items():
+        group = groups[summary_key]
+        for visit_key in visits:
+            totals = visit_totals[visit_key]
+            group["medical_total"] += totals["medical_total"]
+            group["fund_total"] += totals["fund_total"]
+
+    if successful == 0:
+        detail = warnings[0] if warnings else "没有形成有效的两项配对"
+        raise CalculationError(f"没有成功计算的两项配对：{detail}")
+
+    total_fund = Decimal("0")
+    total_count = 0
+    for (_, insurance, visit_type), group in groups.items():
+        bucket = insurance_bucket(insurance)
+        assert bucket is not None
+        if visit_type == "门诊":
+            rate = group["fund_total"] / group["medical_total"]
+        else:
+            rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
+        amount = group["calculation_base"] * rate
+        group["fund_amount"] = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        group["rates"].add(rate)
+        total_fund += group["fund_amount"]
+        total_count += group["count"]
+    if total_count != successful:
+        raise CalculationError(f"人次勾稽校验失败：分组人次合计 {total_count} 与成功匹配数 {successful} 不一致。")
+
+    write_output_sheet(
+        output, path, source.title, options, groups, processed, successful, errors,
+        total_fund, warnings, excluded,
+        [("配对数量合计", paired_quantity_total), ("未配对数量合计", unmatched_quantity_total)],
+    )
+    backup_path = save_workbook_safely(
+        workbook, path, output_name, total_fund, successful, len(groups), keep_vba, formula_caches,
+    )
+    return FileResult(path, output_name, processed, successful, errors, excluded, total_fund, warnings, backup_path)
+
+
 def create_output_sheet_name(workbook, overwrite: bool) -> str:
     if OUTPUT_SHEET not in workbook.sheetnames or overwrite:
         return OUTPUT_SHEET
@@ -610,7 +913,12 @@ def save_workbook_safely(
                 pass
 
 
-def write_output_sheet(output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict, processed: int, successful: int, errors: int, total_fund: Decimal, warnings: list[str], excluded: int) -> None:
+def write_output_sheet(
+    output, path: Path, source_name: str, options: RunOptions, groups: OrderedDict,
+    processed: int, successful: int, errors: int, total_fund: Decimal,
+    warnings: list[str], excluded: int,
+    extra_audit: list[tuple[str, Any]] | None = None,
+) -> None:
     navy = PatternFill("solid", fgColor="1F4E78")
     blue = PatternFill("solid", fgColor="D9EAF7")
     output.merge_cells("A1:I1")
@@ -622,7 +930,9 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         ("源文件", path.name), ("源数据 Sheet", source_name), ("规则大类", options.rule_type),
         ("业务类型", options.visit_type), ("参保地（比例表匹配）", options.pooling_area),
         ("医疗机构级别", options.institution_level), ("比例版本", RATE_VERSION),
-        ("处理记录数", processed), ("计算成功数", successful), ("异常数", errors),
+        ("处理记录数", processed),
+        ("成功匹配数" if options.rule_type == "两项同时收取" else "计算成功数", successful),
+        ("异常数", errors),
         ("基金金额合计", total_fund),
         ("排除险种记录数", excluded),
     ]
@@ -640,7 +950,10 @@ def write_output_sheet(output, path: Path, source_name: str, options: RunOptions
         ("扣减单价", options.deduction_price if options.deduction_price is not None else "未填写"),
         ("扣减数量", options.deduction_quantity if options.deduction_quantity is not None else "未填写"),
         ("输出形式", "普通汇总表（非 Excel 原生透视表）"),
+        ("同时口径", options.simultaneous_scope if options.rule_type == "两项同时收取" else "不适用"),
     ]
+    if extra_audit:
+        audit_metadata.extend(extra_audit)
     for row, (label, value) in enumerate(audit_metadata, 2):
         output.cell(row, 10, label).font = Font(bold=True)
         output.cell(row, 10).fill = blue
@@ -733,6 +1046,7 @@ class CalculatorApp(tk.Tk):
         self.source_sheet = tk.StringVar(value=AUTO_SOURCE_SHEET)
         self.deduction_price = tk.StringVar()
         self.deduction_quantity = tk.StringVar()
+        self.simultaneous_scope = tk.StringVar(value=SIMULTANEOUS_SCOPES[0])
         self.overwrite_result = tk.BooleanVar(value=False)
         self._build()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -741,7 +1055,7 @@ class CalculatorApp(tk.Tk):
         container = ttk.Frame(self, padding=16)
         container.pack(fill="both", expand=True)
         ttk.Label(container, text="基金金额自动测算工具", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        ttk.Label(container, text="先按结果维度汇总；固定比例下住院、门诊均使用比例表，其余规则门诊动态计算。", foreground="#555555").pack(anchor="w", pady=(4, 12))
+        ttk.Label(container, text="先按结果维度汇总；两项同时收取按就诊ID和所选时间口径配对。", foreground="#555555").pack(anchor="w", pady=(4, 12))
         file_bar = ttk.Frame(container)
         file_bar.pack(fill="x")
         self.pick_button = ttk.Button(file_bar, text="选择 Excel 文件", command=self.pick_files)
@@ -753,13 +1067,14 @@ class CalculatorApp(tk.Tk):
 
         params = ttk.LabelFrame(container, text="参数", padding=12)
         params.pack(fill="x", pady=12)
-        self.add_combo(params, "规则大类", self.rule_type, ["通用", "串换", "固定比例"], 0, 0)
+        self.add_combo(params, "规则大类", self.rule_type, ["通用", "串换", "固定比例", "两项同时收取"], 0, 0)
         self.add_combo(params, "业务类型", self.visit_type, ["自动识别", "住院", "门诊"], 0, 1)
         self.add_combo(params, "参保地（比例表匹配）", self.pooling_area, list(FUND_RATES), 1, 0)
         self.add_combo(params, "医疗机构级别", self.institution_level, ["三级", "二级", "一级"], 1, 1)
         ttk.Label(params, text="源数据 Sheet").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.source_sheet_combo = ttk.Combobox(params, textvariable=self.source_sheet, values=[AUTO_SOURCE_SHEET], width=26)
         self.source_sheet_combo.grid(row=2, column=1, sticky="ew", pady=(10, 0))
+        self.add_combo(params, "同时口径（仅两项同时收取）", self.simultaneous_scope, list(SIMULTANEOUS_SCOPES), 2, 1)
         ttk.Label(params, text="扣减单价（仅串换无违规金额列时）").grid(row=3, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(params, textvariable=self.deduction_price, width=26).grid(row=3, column=1, sticky="ew", pady=(8, 0))
         ttk.Label(params, text="扣减数量（串换必填）").grid(row=4, column=0, sticky="w", pady=(8, 0))
@@ -814,6 +1129,7 @@ class CalculatorApp(tk.Tk):
                 optional_decimal(self.deduction_price.get(), "扣减单价"),
                 optional_decimal(self.deduction_quantity.get(), "扣减数量"), self.overwrite_result.get(),
                 None if self.source_sheet.get() in {"", AUTO_SOURCE_SHEET} else self.source_sheet.get(),
+                self.simultaneous_scope.get(),
             )
             validate_options(options)
         except CalculationError as exc:

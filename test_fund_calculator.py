@@ -13,6 +13,13 @@ FIXTURE_DIR = Path(__file__).with_name("test_fixtures")
 
 
 class CalculatorTests(unittest.TestCase):
+    PAIR_HEADERS = [
+        "定点编码", "定点名称", "就诊ID", "医疗类别编码", "医疗类别", "险种类型",
+        "医疗费总额", "基金支付总额",
+        "医保目录编码1", "医保目录名称1", "单价1", "处方日期1", "数量1",
+        "医保目录编码2", "医保目录名称2", "单价2", "处方日期2", "数量2",
+    ]
+
     @staticmethod
     def make_source(path: Path, sheet_names: tuple[str, ...] = ("业务明细",)) -> None:
         workbook = Workbook()
@@ -119,7 +126,7 @@ class CalculatorTests(unittest.TestCase):
                 self.assertEqual(output.cell(rows["门诊"], 9).value, 0.5684)
                 self.assertEqual(output.cell(rows["住院"], 8).value, 11.37)
                 self.assertEqual(output.cell(rows["住院"], 9).value, 0.5684)
-                self.assertEqual(output["K3"].value, "0.9.1")
+                self.assertEqual(output["K3"].value, "1.0.0")
                 self.assertEqual(output["K6"].value, "普通汇总表（非 Excel 原生透视表）")
             finally:
                 saved.close()
@@ -349,6 +356,7 @@ class CalculatorTests(unittest.TestCase):
             (RunOptions("通用", "自动识别", "廊坊市", "三级", Decimal("-1"), None, True), "扣减单价"),
             (RunOptions("串换", "自动识别", "廊坊市", "三级", None, Decimal("-1"), True), "扣减数量"),
             (RunOptions("串换", "自动识别", "廊坊市", "三级", None, Decimal("NaN"), True), "扣减数量"),
+            (RunOptions("两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, "按秒"), "同时口径"),
         )
         validate_options(valid)
         for options, message in invalid_options:
@@ -510,8 +518,161 @@ class CalculatorTests(unittest.TestCase):
             self.assertEqual(next(iter(output.tables.values())).ref, "A7:I8")
             self.assertEqual(output["G8"].value, 1)
             self.assertEqual(output["J2"].value, "生成时间")
-            self.assertEqual(output["K3"].value, "0.9.1")
+            self.assertEqual(output["K3"].value, "1.0.0")
             saved.close()
+
+    def test_simultaneous_pair_calculates_both_items(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pair.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(self.PAIR_HEADERS)
+            source.append([
+                "H1", "医院", "V1", 21, "普通住院", "城乡", 1000, 500,
+                "A", "项目一", 10, "2026-09-19 10:15:03", 3,
+                "B", "项目二", 20, "2026-09-19 10:15:48", 2,
+            ])
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions(
+                "两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, "同日同时同分",
+            ))
+
+            self.assertEqual((result.processed, result.successful, result.errors), (1, 1, 0))
+            self.assertEqual(result.total_fund, Decimal("34.10"))
+            saved = load_workbook(path, data_only=True)
+            output = saved["基金测算"]
+            self.assertEqual(output["E8"].value, 1000)
+            self.assertEqual(output["F8"].value, 4)
+            self.assertEqual(output["G8"].value, 1)
+            self.assertEqual(output["H8"].value, 34.1)
+            self.assertEqual(output["K7"].value, "同日同时同分")
+            self.assertEqual(output["K8"].value, 2)
+            self.assertEqual(output["K9"].value, 1)
+            saved.close()
+
+    def test_simultaneous_scopes_use_selected_time_granularity(self):
+        cases = (
+            ("同日同时同分", "2026-09-19 10:15:03", "2026-09-19 10:15:48", True),
+            ("同日同时同分", "2026-09-19 10:15:03", "2026-09-19 10:16:00", False),
+            ("同日同时", "2026-09-19 10:15:03", "2026-09-19 10:59:59", True),
+            ("同日同时", "2026-09-19 10:15:03", "2026-09-19 11:00:00", False),
+            ("同日", "2026-09-19 10:15:03", "2026-09-19 23:59:59", True),
+            ("同日", "2026-09-19 10:15:03", "2026-09-20 00:00:00", False),
+            ("同一次住院", "2026-09-19 10:15:03", "2026-09-25 12:00:00", True),
+        )
+        for scope, time1, time2, succeeds in cases:
+            with self.subTest(scope=scope, time1=time1, time2=time2), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "scope.xlsx"
+                workbook = Workbook()
+                source = workbook.active
+                source.append(self.PAIR_HEADERS)
+                source.append([
+                    "H1", "医院", "V1", 21, "普通住院", "城乡", 1000, 500,
+                    "A", "项目一", 10, time1, 1, "B", "项目二", 20, time2, 1,
+                ])
+                workbook.save(path)
+                workbook.close()
+                options = RunOptions("两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, scope)
+                if succeeds:
+                    self.assertEqual(run_file(path, options).successful, 1)
+                else:
+                    with self.assertRaisesRegex(CalculationError, "没有成功计算的两项配对"):
+                        run_file(path, options)
+
+    def test_simultaneous_aggregates_prices_and_deduplicates_visit_totals(self):
+        for scope, expected_matches in (("同日", 1), ("同日同时同分", 2)):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "multi-price.xlsx"
+                workbook = Workbook()
+                source = workbook.active
+                source.append(self.PAIR_HEADERS)
+                source.append([
+                    "H1", "医院", "V1", 21, "普通住院", "城乡", 1000, 500,
+                    "A", "项目一", 10, "2026-09-19 09:00:00", 1,
+                    "B", "项目二", 20, "2026-09-19 09:00:00", 1,
+                ])
+                source.append([
+                    "H1", "医院", "V1", 21, "普通住院", "城乡", 1000, 500,
+                    "A", "项目一", 12, "2026-09-19 10:00:00", 2,
+                    "B", "项目二", 22, "2026-09-19 10:00:00", 1,
+                ])
+                workbook.save(path)
+                workbook.close()
+
+                result = run_file(path, RunOptions(
+                    "两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, scope,
+                ))
+
+                self.assertEqual((result.processed, result.successful), (2, expected_matches))
+                self.assertEqual(result.total_fund, Decimal("36.38"))
+                saved = load_workbook(path, data_only=True)
+                output = saved["基金测算"]
+                self.assertEqual(output["E8"].value, 1000)
+                self.assertEqual(output["F8"].value, 4)
+                self.assertEqual(output["G8"].value, expected_matches)
+                saved.close()
+
+    def test_simultaneous_outpatient_uses_dynamic_rate_and_rejects_admission_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "outpatient-pair.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(self.PAIR_HEADERS)
+            source.append([
+                "H1", "医院", "V1", 11, "普通门诊", "城乡", 1000, 500,
+                "A", "项目一", 10, "2026-09-19 10:00:00", 3,
+                "B", "项目二", 20, "2026-09-19 10:00:00", 2,
+            ])
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions(
+                "两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, "同日同时同分",
+            ))
+            self.assertEqual(result.total_fund, Decimal("30.00"))
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "outpatient-admission.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(self.PAIR_HEADERS)
+            source.append([
+                "H1", "医院", "V1", 11, "普通门诊", "城乡", 1000, 500,
+                "A", "项目一", 10, "2026-09-19 10:00:00", 1,
+                "B", "项目二", 20, "2026-09-20 10:00:00", 1,
+            ])
+            workbook.save(path)
+            workbook.close()
+            with self.assertRaisesRegex(CalculationError, "同一次住院"):
+                run_file(path, RunOptions(
+                    "两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, "同一次住院",
+                ))
+
+    def test_simultaneous_duplicate_pair_is_not_double_counted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "duplicate-pair.xlsx"
+            workbook = Workbook()
+            source = workbook.active
+            source.append(self.PAIR_HEADERS)
+            row = [
+                "H1", "医院", "V1", 21, "普通住院", "城乡", 1000, 500,
+                "A", "项目一", 10, "2026-09-19 10:00:00", 1,
+                "B", "项目二", 20, "2026-09-19 10:00:00", 1,
+            ]
+            source.append(row)
+            source.append(row)
+            workbook.save(path)
+            workbook.close()
+
+            result = run_file(path, RunOptions(
+                "两项同时收取", "自动识别", "廊坊市", "三级", None, None, True, None, "同日同时同分",
+            ))
+
+            self.assertEqual((result.processed, result.successful, result.errors), (2, 1, 1))
+            self.assertEqual(result.total_fund, Decimal("17.05"))
+            self.assertIn("重复", result.warnings[0])
 
 
 if __name__ == "__main__":
