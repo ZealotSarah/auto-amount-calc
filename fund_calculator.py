@@ -1,12 +1,13 @@
 """基金金额自动测算工具。
 
-结果 Sheet 仅输出用户约定的九列汇总字段。固定比例规则下住院和门诊
-均使用内置的《24年25年目录内（费用）住院基金支付比例》。
+结果 Sheet 仅输出用户约定的九列汇总字段。报销比例支持内置表和
+按年份、地市、医院等级保存的自定义比例。
 """
 
 from __future__ import annotations
 
 import datetime as dt
+from reimbursement_rates import LEVELS, load_records, save_records, validate_record, read_pdf
 import os
 import posixpath
 import re
@@ -34,8 +35,7 @@ except ImportError:  # 无 GUI 环境（如无 Tk 的测试环境）下仍可导
     filedialog = messagebox = ttk = None
 
 
-RATE_VERSION = "24-25 年住院基金支付比例"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 OUTPUT_SHEET = "基金测算"
 AUTO_SOURCE_SHEET = "自动选择（仅唯一匹配时）"
 SUMMARY_HEADERS = ("医疗机构编码", "医疗机构名称", "险种类别", "医疗类别", "医疗总额", "数量总和", "人次", "基金金额", "报销比例")
@@ -137,6 +137,8 @@ class RunOptions:
     overwrite_result: bool
     source_sheet: str | None = None
     simultaneous_scope: str = "同日同时同分"
+    rate_year: str = "2024-2025（内置）"
+    custom_rates: dict | None = None
 
 
 @dataclass
@@ -299,10 +301,13 @@ def validate_options(options: RunOptions) -> None:
         raise CalculationError("请选择规则大类。")
     if options.visit_type not in {"自动识别", "住院", "门诊"}:
         raise CalculationError("请选择业务类型。")
-    if options.pooling_area not in FUND_RATES:
+    if options.pooling_area not in (options.custom_rates if options.custom_rates is not None else FUND_RATES):
         raise CalculationError("请选择参保地（比例表匹配）。")
     if options.institution_level not in {"三级", "二级", "一级"}:
         raise CalculationError("请选择医疗机构级别。")
+    rates = options.custom_rates if options.custom_rates is not None else FUND_RATES
+    if options.institution_level not in rates[options.pooling_area]:
+        raise CalculationError("当前年份、地市尚未保存该医院等级的比例，请先补录。")
     for value, label in ((options.deduction_price, "扣减单价"), (options.deduction_quantity, "扣减数量")):
         if value is not None and (not value.is_finite() or value < 0):
             raise CalculationError(f"{label}必须是大于或等于 0 的有限数字。")
@@ -586,11 +591,11 @@ def calculate_workbook(workbook, path: Path, options: RunOptions, keep_vba: bool
         bucket = insurance_bucket(insurance)
         assert bucket is not None
         if options.rule_type == "固定比例":
-            rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
+            rate = (options.custom_rates if options.custom_rates is not None else FUND_RATES)[options.pooling_area][options.institution_level][bucket]
         elif visit_type == "门诊":
             rate = group["fund_total"] / group["medical_total"]
         else:
-            rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
+            rate = (options.custom_rates if options.custom_rates is not None else FUND_RATES)[options.pooling_area][options.institution_level][bucket]
         amount = group["calculation_base"] * rate
         group["fund_amount"] = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         group["rates"].add(rate)
@@ -795,7 +800,7 @@ def calculate_simultaneous_workbook(
         if visit_type == "门诊":
             rate = group["fund_total"] / group["medical_total"]
         else:
-            rate = FUND_RATES[options.pooling_area][options.institution_level][bucket]
+            rate = (options.custom_rates if options.custom_rates is not None else FUND_RATES)[options.pooling_area][options.institution_level][bucket]
         amount = group["calculation_base"] * rate
         group["fund_amount"] = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         group["rates"].add(rate)
@@ -929,7 +934,7 @@ def write_output_sheet(
     metadata = [
         ("源文件", path.name), ("源数据 Sheet", source_name), ("规则大类", options.rule_type),
         ("业务类型", options.visit_type), ("参保地（比例表匹配）", options.pooling_area),
-        ("医疗机构级别", options.institution_level), ("比例版本", RATE_VERSION),
+        ("医疗机构级别", options.institution_level), ("比例版本", options.rate_year),
         ("处理记录数", processed),
         ("成功匹配数" if options.rule_type == "两项同时收取" else "计算成功数", successful),
         ("异常数", errors),
@@ -1035,12 +1040,19 @@ class CalculatorApp(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"基金金额自动测算工具 v{APP_VERSION}")
-        self.geometry("760x610")
+        self.geometry("920x700")
         self.minsize(680, 560)
         self.files: list[Path] = []
         self.running = False
         self.rule_type = tk.StringVar(value="通用")
         self.visit_type = tk.StringVar(value="自动识别")
+        self.rate_year = tk.StringVar(value="2024-2025（内置）")
+        try:
+            self.rate_records = load_records()
+        except (ValueError, OSError, KeyError) as exc:
+            messagebox.showerror("比例配置读取失败", str(exc))
+            self.destroy()
+            raise
         self.pooling_area = tk.StringVar()
         self.institution_level = tk.StringVar()
         self.source_sheet = tk.StringVar(value=AUTO_SOURCE_SHEET)
@@ -1049,6 +1061,7 @@ class CalculatorApp(tk.Tk):
         self.simultaneous_scope = tk.StringVar(value=SIMULTANEOUS_SCOPES[0])
         self.overwrite_result = tk.BooleanVar(value=False)
         self._build()
+        self.refresh_rates()
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
     def _build(self) -> None:
@@ -1069,7 +1082,7 @@ class CalculatorApp(tk.Tk):
         params.pack(fill="x", pady=12)
         self.add_combo(params, "规则大类", self.rule_type, ["通用", "串换", "固定比例", "两项同时收取"], 0, 0)
         self.add_combo(params, "业务类型", self.visit_type, ["自动识别", "住院", "门诊"], 0, 1)
-        self.add_combo(params, "参保地（比例表匹配）", self.pooling_area, list(FUND_RATES), 1, 0)
+        self.area_combo = self.add_combo(params, "参保地（比例表匹配）", self.pooling_area, list(FUND_RATES), 1, 0)
         self.add_combo(params, "医疗机构级别", self.institution_level, ["三级", "二级", "一级"], 1, 1)
         ttk.Label(params, text="源数据 Sheet").grid(row=2, column=0, sticky="w", pady=(10, 0))
         self.source_sheet_combo = ttk.Combobox(params, textvariable=self.source_sheet, values=[AUTO_SOURCE_SHEET], width=26)
@@ -1080,6 +1093,9 @@ class CalculatorApp(tk.Tk):
         ttk.Label(params, text="扣减数量（串换必填）").grid(row=4, column=0, sticky="w", pady=(8, 0))
         ttk.Entry(params, textvariable=self.deduction_quantity, width=26).grid(row=4, column=1, sticky="ew", pady=(8, 0))
         ttk.Checkbutton(params, text="覆盖已有“基金测算”Sheet（否则自动新建带时间的 Sheet）", variable=self.overwrite_result).grid(row=5, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.year_combo = self.add_combo(params, "比例年份", self.rate_year, [], 6, 0)
+        self.year_combo.bind("<<ComboboxSelected>>", lambda event: self.refresh_rates())
+        ttk.Button(params, text="比例管理 / 导入 PDF / 手动录入", command=self.manage_rates).grid(row=6, column=2, columnspan=2, sticky="w")
         params.columnconfigure(1, weight=1)
 
         controls = ttk.Frame(container)
@@ -1096,6 +1112,112 @@ class CalculatorApp(tk.Tk):
         combo = ttk.Combobox(parent, textvariable=variable, values=values, state="readonly", width=26)
         combo.grid(row=row, column=base + 1, sticky="ew", padx=(0, 20), pady=4)
         parent.columnconfigure(base + 1, weight=1)
+        return combo
+
+    def selected_rates(self):
+        if self.rate_year.get() == "2024-2025（内置）":
+            return None
+        rates = {}
+        for record in self.rate_records:
+            if record["year"] == self.rate_year.get():
+                rates.setdefault(record["area"], {})[record["level"]] = tuple(Decimal(v) for v in record["rates"])
+        return rates
+
+    def refresh_rates(self):
+        self.year_combo.configure(values=["2024-2025（内置）"] + sorted({r["year"] for r in self.rate_records}))
+        rates = self.selected_rates()
+        areas = list(FUND_RATES if rates is None else rates)
+        self.area_combo.configure(values=areas)
+        if self.pooling_area.get() not in areas:
+            self.pooling_area.set("")
+
+    def manage_rates(self):
+        if self.running:
+            messagebox.showinfo("正在测算", "请等待测算结束后管理比例。")
+            return
+        window = tk.Toplevel(self)
+        window.title("报销比例管理（比例填写百分数，例如 84.23）")
+        window.geometry("820x540")
+        window.transient(self)
+        window.grab_set()
+        records = [dict(r) for r in self.rate_records]
+        last_edited = None
+        fields = [tk.StringVar() for _ in range(6)]
+        labels = ("年份", "地市", "医院等级", "职工 %", "居民 %", "合计 %")
+        form = ttk.Frame(window, padding=12)
+        form.pack(fill="x")
+        for i, (label, var) in enumerate(zip(labels, fields)):
+            ttk.Label(form, text=label).grid(row=0, column=i)
+            if i == 2:
+                widget = ttk.Combobox(form, textvariable=var, values=LEVELS, state="readonly", width=10)
+            else:
+                widget = ttk.Entry(form, textvariable=var, width=14)
+            widget.grid(row=1, column=i, padx=3)
+        tree = ttk.Treeview(window, columns=labels, show="headings", selectmode="browse")
+        for label in labels:
+            tree.heading(label, text=label)
+            tree.column(label, width=120)
+        tree.pack(fill="both", expand=True, padx=12, pady=8)
+
+        def redraw():
+            tree.delete(*tree.get_children())
+            for i, r in enumerate(records):
+                tree.insert("", "end", iid=str(i), values=[r["year"], r["area"], r["level"]] + [str(Decimal(v) * 100) for v in r["rates"]])
+
+        def select(event):
+            if tree.selection():
+                for var, value in zip(fields, tree.item(tree.selection()[0], "values")):
+                    var.set(value)
+        tree.bind("<<TreeviewSelect>>", select)
+
+        def merge(record):
+            nonlocal last_edited
+            key = (record["year"], record["area"], record["level"])
+            records[:] = [r for r in records if (r["year"], r["area"], r["level"]) != key]
+            records.append(record)
+            last_edited = record
+
+        def add():
+            try:
+                merge(validate_record(dict(year=fields[0].get(), area=fields[1].get(), level=fields[2].get(), rates=[str(as_decimal(v.get().rstrip("%％"), "比例") / 100) for v in fields[3:]])))
+                redraw()
+            except (ValueError, CalculationError, InvalidOperation) as exc:
+                messagebox.showerror("录入失败", str(exc), parent=window)
+
+        def import_pdf():
+            path = filedialog.askopenfilename(parent=window, filetypes=[("PDF 文件", "*.pdf")])
+            if not path:
+                return
+            try:
+                imported = read_pdf(path)
+                for record in imported:
+                    merge(record)
+                redraw()
+                messagebox.showinfo("识别完成", f"识别到 {len(imported)} 条比例，请核对表格，可选中修改后保存。未识别的内容请手动补录。", parent=window)
+            except Exception as exc:
+                messagebox.showerror("识别失败，可手动录入", str(exc), parent=window)
+
+        def save():
+            try:
+                save_records(records)
+            except (ValueError, OSError) as exc:
+                messagebox.showerror("保存失败", str(exc), parent=window)
+                return
+            self.rate_records = records
+            if last_edited is not None:
+                self.rate_year.set(last_edited["year"])
+            self.refresh_rates()
+            if last_edited is not None:
+                self.pooling_area.set(last_edited["area"])
+            window.destroy()
+
+        bar = ttk.Frame(window, padding=12)
+        bar.pack(fill="x")
+        ttk.Button(bar, text="导入 PDF", command=import_pdf).pack(side="left")
+        ttk.Button(bar, text="添加 / 更新录入行", command=add).pack(side="left", padx=8)
+        ttk.Button(bar, text="保存全部比例", command=save).pack(side="right")
+        ttk.Label(window, text="同年份、地市、医院等级的记录会更新；先添加/更新录入行，再保存全部比例。", padding=8).pack()
+        redraw()
 
     def pick_files(self) -> None:
         selections = filedialog.askopenfilenames(title="选择需要测算的 Excel 文件", filetypes=[("Excel 文件", "*.xlsx *.xlsm")])
@@ -1129,7 +1251,7 @@ class CalculatorApp(tk.Tk):
                 optional_decimal(self.deduction_price.get(), "扣减单价"),
                 optional_decimal(self.deduction_quantity.get(), "扣减数量"), self.overwrite_result.get(),
                 None if self.source_sheet.get() in {"", AUTO_SOURCE_SHEET} else self.source_sheet.get(),
-                self.simultaneous_scope.get(),
+                self.simultaneous_scope.get(), self.rate_year.get(), self.selected_rates(),
             )
             validate_options(options)
         except CalculationError as exc:

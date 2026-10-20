@@ -7,7 +7,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 
-from fund_calculator import CalculationError, RunOptions, insurance_bucket, resolved_visit_type, run_file, validate_options
+from fund_calculator import APP_VERSION, CalculationError, RunOptions, insurance_bucket, resolved_visit_type, run_file, validate_options
 
 FIXTURE_DIR = Path(__file__).with_name("test_fixtures")
 
@@ -126,7 +126,7 @@ class CalculatorTests(unittest.TestCase):
                 self.assertEqual(output.cell(rows["门诊"], 9).value, 0.5684)
                 self.assertEqual(output.cell(rows["住院"], 8).value, 11.37)
                 self.assertEqual(output.cell(rows["住院"], 9).value, 0.5684)
-                self.assertEqual(output["K3"].value, "1.0.0")
+                self.assertEqual(output["K3"].value, APP_VERSION)
                 self.assertEqual(output["K6"].value, "普通汇总表（非 Excel 原生透视表）")
             finally:
                 saved.close()
@@ -518,7 +518,7 @@ class CalculatorTests(unittest.TestCase):
             self.assertEqual(next(iter(output.tables.values())).ref, "A7:I8")
             self.assertEqual(output["G8"].value, 1)
             self.assertEqual(output["J2"].value, "生成时间")
-            self.assertEqual(output["K3"].value, "1.0.0")
+            self.assertEqual(output["K3"].value, APP_VERSION)
             saved.close()
 
     def test_simultaneous_pair_calculates_both_items(self):
